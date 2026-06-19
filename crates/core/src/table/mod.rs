@@ -100,6 +100,7 @@ use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
+use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -107,6 +108,7 @@ use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::meta_field::MetaField;
+use crate::metadata::table::record_index;
 use crate::schema::resolver::{
     resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema, resolve_schema,
 };
@@ -520,12 +522,84 @@ impl Table {
             )
             .await?;
 
+        self.prune_file_slices_with_record_index(timestamp, filters, &mut file_slices)
+            .await?;
+
         if base_file_only {
             for fs in &mut file_slices {
                 fs.log_files.clear();
             }
         }
         Ok(file_slices)
+    }
+
+    /// Prune `file_slices` to those that can hold a record matching an equality / `IN`
+    /// predicate on the record key, using the metadata table record-level index.
+    ///
+    /// Only applies to a single-field record key, when the metadata table has a
+    /// `record_index` partition and the query targets the latest commit (the index
+    /// reflects the latest state). When at least one key resolves, slices not matching any
+    /// resolved `(partition, file_id)` location are dropped; if no key resolves, slices are
+    /// left untouched and the row-level mask still applies — so this never drops a file a
+    /// matching row could live in.
+    async fn prune_file_slices_with_record_index(
+        &self,
+        timestamp: &str,
+        filters: &[Filter],
+        file_slices: &mut Vec<FileSlice>,
+    ) -> Result<()> {
+        let Some(record_keys) = self.record_index_keys_from_filters(filters) else {
+            return Ok(());
+        };
+        // The record index reflects the latest state, so only use it at the latest commit.
+        if self.timeline.get_latest_commit_timestamp_as_option() != Some(timestamp) {
+            return Ok(());
+        }
+        if !self
+            .get_metadata_table_partitions()
+            .iter()
+            .any(|p| p == record_index::RECORD_INDEX_PARTITION_NAME)
+        {
+            return Ok(());
+        }
+
+        let key_refs: Vec<&str> = record_keys.iter().map(String::as_str).collect();
+        let locations = self.lookup_record_index(&key_refs).await?;
+        if locations.is_empty() {
+            return Ok(());
+        }
+
+        let allowed: std::collections::HashSet<(&str, &str)> = locations
+            .values()
+            .map(|loc| (loc.partition_path.as_str(), loc.file_id.as_str()))
+            .collect();
+        file_slices.retain(|fs| allowed.contains(&(fs.partition_path.as_str(), fs.file_id())));
+        Ok(())
+    }
+
+    /// Extract record-key lookup values from equality / `IN` filters on a single-field
+    /// record key. Returns `None` when the table has a composite record key or no such
+    /// filter is present.
+    fn record_index_keys_from_filters(&self, filters: &[Filter]) -> Option<Vec<String>> {
+        let record_key_fields: Vec<String> = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::RecordKeyFields)
+            .into();
+        let [key_field] = record_key_fields.as_slice() else {
+            return None;
+        };
+
+        let mut keys: Vec<String> = Vec::new();
+        for filter in filters {
+            if &filter.field != key_field {
+                continue;
+            }
+            match filter.operator {
+                ExprOperator::Eq | ExprOperator::In => keys.extend(filter.values.iter().cloned()),
+                _ => {}
+            }
+        }
+        if keys.is_empty() { None } else { Some(keys) }
     }
 
     async fn get_file_slices_between_inner(
@@ -1590,6 +1664,56 @@ mod tests {
         }
 
         assert_eq!(stream_rows, eager_rows);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_pruned_by_record_index() {
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let hudi_table = Table::new(&table_path).await.unwrap();
+
+        // Baseline: no filter returns file slices across all partitions.
+        let all_slices = hudi_table
+            .get_file_slices(&ReadOptions::new())
+            .await
+            .unwrap();
+        assert!(
+            all_slices.len() > 1,
+            "fixture should have multiple file slices"
+        );
+
+        // A known record key (uuid) resolves to exactly one file group via the RLI.
+        let key = "334e26e9-8355-45cc-97c6-c31daf0df330";
+        let location = hudi_table.lookup_record_index(&[key]).await.unwrap();
+        let loc = location.get(key).expect("key should be indexed").clone();
+
+        let pruned = hudi_table
+            .get_file_slices(
+                &ReadOptions::new()
+                    .with_filters([("uuid", "=", key)])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pruned.len(),
+            1,
+            "record-index lookup should leave a single file slice"
+        );
+        assert_eq!(pruned[0].partition_path, loc.partition_path);
+        assert_eq!(pruned[0].file_id(), loc.file_id.as_str());
+
+        // An unknown key resolves to nothing, so RLI pruning is skipped (the row mask
+        // downstream still yields no rows); slices are not dropped at planning time.
+        let absent = hudi_table
+            .get_file_slices(
+                &ReadOptions::new()
+                    .with_filters([("uuid", "=", "00000000-0000-0000-0000-000000000000")])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(absent.len(), all_slices.len());
     }
 
     #[tokio::test]

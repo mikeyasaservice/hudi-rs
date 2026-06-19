@@ -92,10 +92,12 @@ that exists today.
   per-partition `StatisticsContainer`s and fed to `FilePruner` to drop whole partitions before
   any file in them is read. _Med / M._
 - **MDT record-level index (RLI) → point lookups** for equality on record keys; large win for
-  engines pushing key predicates. _Lookup API landed_ (`metadata/table/record_index.rs`):
+  engines pushing key predicates. _Landed_ (`metadata/table/record_index.rs`):
   `Table::lookup_record_index` resolves record keys to their `(partition, file_id)` location
-  (decoding the Java-UUID file-id bits). Planning integration to auto-prune file groups on
-  record-key filters is the remaining step. _High / M._
+  (decoding the Java-UUID file-id bits), and snapshot planning auto-prunes file slices for
+  equality / `IN` filters on a single-field record key (`table/mod.rs`,
+  `prune_file_slices_with_record_index`). Remaining: composite record keys and reproducing the
+  bucket hash to probe one bucket instead of all. _High / M._
 - **CDC read queries.** Parse `.cdc` log blocks and expose a change-feed query type. _High / M._
 - **Log-only file groups.** MOR slices with no base file currently error; unblocks tables written
   with certain configs. Contained, explicitly flagged P1. _Med / M._
