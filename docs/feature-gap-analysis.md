@@ -83,8 +83,9 @@ that exists today.
 - **MDT column-stats partition → planning-time data skipping.** Highest read-perf lever.
   _Initial implementation landed_ (`metadata/table/column_stats.rs`, wired in `table/fs_view.rs`):
   the `column_stats` base HFiles are decoded into per-file `StatisticsContainer`s and fed to
-  `FilePruner`, skipping files without a footer read. Remaining: source stats from
-  post-compaction delta logs, and add IN/NOT-IN + decimal support. _High / M._
+  `FilePruner`, skipping files without a footer read. `IN` / `NOT IN` list pruning is
+  supported (`table/file_pruner.rs`). Remaining: source stats from post-compaction delta
+  logs, and decimal min/max support. _High / M._
 - **MDT partition-stats partition → partition pruning** without listing.
   _Landed_ (`metadata/table/column_stats.rs`, wired in `table/fs_view.rs`): the `partition_stats`
   base HFiles (same payload as column stats, aggregated per partition) are decoded into
