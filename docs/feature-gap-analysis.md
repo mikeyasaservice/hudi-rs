@@ -57,7 +57,7 @@ that exists today.
 | Write path | ✗ Absent | No insert/upsert/delete/bulk_insert; no commit, markers, or `hoodie.properties` init |
 | COW reads | ✓ Complete | Snapshot, time-travel, incremental, snapshot streaming |
 | MOR reads | ✓ Complete | Base + log merge; read-optimized mode; rollback blocks honored |
-| Incremental streaming | ✗ Absent | `read_stream` errors `Unsupported` (`table/mod.rs:821`) |
+| Incremental streaming | ✓ Complete | `read_stream` streams the `(start, end]` change records (`table/mod.rs`, `read_incremental_stream_inner`) |
 | Timeline actions | ◑ Partial | Only `commit` / `deltacommit` / `replacecommit` loaded (`timeline/mod.rs`); no clean/compaction/clustering/rollback/savepoint/restore/indexing |
 | LSM archived timeline | ✗ Stub | v2 history reader returns empty (`timeline/loader.rs:256`) |
 | Merge strategies | ◑ Partial | `AppendOnly`, `OverwriteWithLatest`; **single ordering field only** (`config/table.rs:267`) |
@@ -96,7 +96,9 @@ that exists today.
 - **CDC read queries.** Parse `.cdc` log blocks and expose a change-feed query type. _High / M._
 - **Log-only file groups.** MOR slices with no base file currently error; unblocks tables written
   with certain configs. Contained, explicitly flagged P1. _Med / M._
-- **Incremental streaming.** Only eager incremental exists today. _Med / S._
+- **Incremental streaming.** _Landed_ (`table/mod.rs`, `read_incremental_stream_inner`):
+  `read_stream` now streams the `(start, end]` change records for COW and MOR, reusing the
+  eager path's commit-time mask. _Med / S._
 - **Full read-side schema evolution** (add/drop/rename/reorder columns, type promotion). _High / M._
 - **Additional key generators** (Simple, Complex, NonPartitioned, Custom) including filter
   transforms for partition pruning. _Med / M._

@@ -26,7 +26,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use hudi_core::config::read::HudiReadConfig;
-use hudi_core::error::{CoreError, Result};
+use hudi_core::error::Result;
 use hudi_core::table::{QueryType, ReadOptions, Table};
 use hudi_test::{QuickstartTripsTable, SampleTable};
 
@@ -1812,22 +1812,42 @@ mod streaming_queries {
     }
 
     #[tokio::test]
-    async fn test_read_stream_incremental_returns_unsupported() -> Result<()> {
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+    async fn test_read_stream_incremental_matches_eager() -> Result<()> {
+        // Incremental streaming should yield exactly the same change records as the eager
+        // incremental read, for both COW and MOR tables.
+        for base_url in [
+            SampleTable::V9TxnsSimpleOverwrite.url_to_cow(),
+            SampleTable::V9TxnsSimpleOverwrite.url_to_mor_avro(),
+        ] {
+            let hudi_table = Table::new(base_url.path()).await?;
+            let commits: Vec<String> = hudi_table
+                .timeline
+                .completed_commits
+                .iter()
+                .map(|i| i.timestamp.clone())
+                .collect();
+            assert!(commits.len() >= 2, "fixture should have multiple commits");
+            let first = commits.first().unwrap().clone();
+            let last = commits.last().unwrap().clone();
 
-        let err = match hudi_table
-            .read_stream(&ReadOptions::new().with_query_type(QueryType::Incremental))
-            .await
-        {
-            Ok(_) => panic!("incremental streaming should be unsupported"),
-            Err(err) => err,
-        };
-
-        assert!(
-            matches!(err, CoreError::Unsupported(_)),
-            "expected Unsupported for incremental streaming, got: {err}"
-        );
+            for (start, end) in [
+                ("19700101000000000".to_string(), last.clone()),
+                (first.clone(), last.clone()),
+            ] {
+                let options = ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start.as_str())
+                    .with_end_timestamp(end.as_str());
+                let eager = txn_rows(&hudi_table.read(&options).await?);
+                let streamed = txn_rows(
+                    &collect_stream_batches(hudi_table.read_stream(&options).await?).await?,
+                );
+                assert_eq!(
+                    streamed, eager,
+                    "incremental streaming should match eager read for {base_url} range ({start}, {end}]"
+                );
+            }
+        }
         Ok(())
     }
 

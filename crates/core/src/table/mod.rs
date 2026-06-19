@@ -100,7 +100,6 @@ use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
-use crate::error::CoreError;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -792,8 +791,9 @@ impl Table {
 
     /// Streaming read; dispatches on `options.query_type`.
     ///
-    /// Snapshot streams batches as they are read from each file slice. Incremental
-    /// streaming is not yet supported and returns an `Unsupported` error.
+    /// Both snapshot and incremental stream batches as they are read from each file slice.
+    /// Incremental streaming yields the change records in the `(start, end]` range, applying
+    /// the same commit-time mask as the eager incremental read.
     ///
     /// For MOR file slices with log files, streaming falls back to a collect-and-merge
     /// that yields that file slice's merged result as a single batch.
@@ -818,9 +818,7 @@ impl Table {
         let prepared = self.prepare_reader_options(options)?;
         match prepared.query_type()? {
             QueryType::Snapshot => self.read_snapshot_stream_inner(&prepared).await,
-            QueryType::Incremental => Err(CoreError::Unsupported(
-                "Streaming for incremental queries is not yet supported".to_string(),
-            )),
+            QueryType::Incremental => self.read_incremental_stream_inner(&prepared).await,
         }
     }
 
@@ -828,16 +826,49 @@ impl Table {
         &self,
         prepared: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        use futures::stream::{self, StreamExt};
-
         let Some(timestamp) = prepared.end_timestamp() else {
-            return Ok(Box::pin(stream::empty()));
+            return Ok(Box::pin(futures::stream::empty()));
         };
 
         let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
+
+        self.stream_file_slices(prepared, file_slices)
+    }
+
+    async fn read_incremental_stream_inner(
+        &self,
+        prepared: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        let (Some(start), Some(end)) = (prepared.start_timestamp(), prepared.end_timestamp())
+        else {
+            return Ok(Box::pin(futures::stream::empty()));
+        };
+
+        let base_file_only = self.is_base_file_only(prepared)?;
+        let file_slices = self
+            .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
+            .await?;
+
+        // The file group reader is built from `prepared.hudi_options`, which carries the
+        // start/end timestamps; its per-slice reads apply the `(start, end]` commit-time
+        // mask just as the eager incremental path does.
+        self.stream_file_slices(prepared, file_slices)
+    }
+
+    /// Chain per-slice streaming reads of `file_slices` into one batch stream.
+    ///
+    /// Shared by snapshot and incremental streaming: each slice is read lazily via
+    /// [`crate::file_group::reader::FileGroupReader::read_file_slice_stream`], and the
+    /// streams are concatenated, propagating errors to the caller.
+    fn stream_file_slices(
+        &self,
+        prepared: &ReadOptions,
+        file_slices: Vec<FileSlice>,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        use futures::stream::{self, StreamExt};
 
         if file_slices.is_empty() {
             return Ok(Box::pin(stream::empty()));
@@ -855,8 +886,8 @@ impl Table {
         let fg_options_template = self.options_for_file_group(prepared);
         let projection = fg_options_template.projection.clone();
         let row_filters = fg_options_template.filters.clone();
-        // Carry batch_size in hudi_options if set; everything else (timestamps,
-        // query_type) is irrelevant to the per-slice FG-reader read.
+        // Carry batch_size in hudi_options if set; commit-time filtering is driven by the
+        // file group reader's own configs (built above from `prepared.hudi_options`).
         let mut per_slice_hudi_options: HashMap<String, String> = HashMap::new();
         if let Some(bs) = fg_options_template.batch_size()? {
             per_slice_hudi_options.insert(
@@ -1538,19 +1569,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_read_stream_errors_on_incremental() {
+    async fn hudi_table_read_stream_incremental_matches_eager() {
+        use futures::StreamExt;
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let result = hudi_table
-            .read_stream(&ReadOptions::new().with_query_type(QueryType::Incremental))
-            .await;
-        match result {
-            Ok(_) => panic!("incremental streaming must error"),
-            Err(e) => {
-                assert!(matches!(e, CoreError::Unsupported(_)));
-                assert!(e.to_string().contains("not yet supported"));
-            }
+        let options = ReadOptions::new().with_query_type(QueryType::Incremental);
+
+        let eager_rows: usize = hudi_table
+            .read(&options)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+
+        let mut stream = hudi_table.read_stream(&options).await.unwrap();
+        let mut stream_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            stream_rows += batch.unwrap().num_rows();
         }
+
+        assert_eq!(stream_rows, eager_rows);
     }
 
     #[tokio::test]
