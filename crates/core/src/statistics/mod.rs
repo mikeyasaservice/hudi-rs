@@ -357,8 +357,12 @@ fn parquet_stats_to_min_max_arrays(
     }
 }
 
-/// Convert Parquet Int32 physical value to Arrow array based on logical type.
-fn int32_to_array(value: i32, data_type: &DataType) -> ArrayRef {
+/// Convert an Int32 physical value to an Arrow array based on logical type.
+///
+/// Shared by the Parquet-footer path and the metadata-table column-stats path so
+/// both produce min/max arrays whose Arrow type matches the table schema column,
+/// which is required for `arrow_ord` comparisons against cast filter values.
+pub(crate) fn int32_to_array(value: i32, data_type: &DataType) -> ArrayRef {
     match data_type {
         DataType::Int8 => Arc::new(Int8Array::from(vec![value as i8])) as ArrayRef,
         DataType::Int16 => Arc::new(Int16Array::from(vec![value as i16])) as ArrayRef,
@@ -371,8 +375,10 @@ fn int32_to_array(value: i32, data_type: &DataType) -> ArrayRef {
     }
 }
 
-/// Convert Parquet Int64 physical value to Arrow array based on logical type.
-fn int64_to_array(value: i64, data_type: &DataType) -> ArrayRef {
+/// Convert an Int64 physical value to an Arrow array based on logical type.
+///
+/// See [`int32_to_array`] for why conversion is driven by the schema `data_type`.
+pub(crate) fn int64_to_array(value: i64, data_type: &DataType) -> ArrayRef {
     match data_type {
         DataType::Int64 => Arc::new(Int64Array::from(vec![value])) as ArrayRef,
         DataType::UInt64 => Arc::new(UInt64Array::from(vec![value as u64])) as ArrayRef,
@@ -397,8 +403,10 @@ fn int64_to_array(value: i64, data_type: &DataType) -> ArrayRef {
     }
 }
 
-/// Convert Parquet byte array to Arrow array based on logical type.
-fn bytes_to_array(data: &[u8], data_type: &DataType) -> ArrayRef {
+/// Convert a byte array to an Arrow array based on logical type.
+///
+/// See [`int32_to_array`] for why conversion is driven by the schema `data_type`.
+pub(crate) fn bytes_to_array(data: &[u8], data_type: &DataType) -> ArrayRef {
     match data_type {
         DataType::Utf8 | DataType::LargeUtf8 => {
             let s = String::from_utf8_lossy(data).into_owned();
