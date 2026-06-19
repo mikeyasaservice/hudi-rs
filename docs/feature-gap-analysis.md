@@ -61,7 +61,7 @@ that exists today.
 | Timeline actions | ◑ Partial | Only `commit` / `deltacommit` / `replacecommit` loaded (`timeline/mod.rs`); no clean/compaction/clustering/rollback/savepoint/restore/indexing |
 | LSM archived timeline | ✗ Stub | v2 history reader returns empty (`timeline/loader.rs:256`) |
 | Merge strategies | ◑ Partial | `AppendOnly`, `OverwriteWithLatest`; **single ordering field only** (`config/table.rs:267`) |
-| Metadata table | ◑ Partial | `files` + `column_stats` + `partition_stats` partitions read (`metadata/table/column_stats.rs`); `bloom_filters`/`record_index` enums defined but unused |
+| Metadata table | ◑ Partial | `files` + `column_stats` + `partition_stats` read (`metadata/table/column_stats.rs`); `record_index` point lookups (`metadata/table/record_index.rs`); `bloom_filters` enum defined but unused |
 | HFile reader | ✓ Complete | `crates/core/src/hfile/`; powers the MDT |
 | Data skipping | ◑ Partial | MDT `column_stats` (per-file) and `partition_stats` (per-partition) indexes used at planning time when available (`metadata/table/column_stats.rs`, wired in `table/fs_view.rs`), falling back to per-file Parquet footers (`table/file_pruner.rs`); base-HFile sourced only (post-compaction delta logs not yet read) |
 | Partition pruning | ✓ Complete | Hive-style + standard paths (`table/partition.rs`) |
@@ -92,7 +92,10 @@ that exists today.
   per-partition `StatisticsContainer`s and fed to `FilePruner` to drop whole partitions before
   any file in them is read. _Med / M._
 - **MDT record-level index (RLI) → point lookups** for equality on record keys; large win for
-  engines pushing key predicates. _High / M._
+  engines pushing key predicates. _Lookup API landed_ (`metadata/table/record_index.rs`):
+  `Table::lookup_record_index` resolves record keys to their `(partition, file_id)` location
+  (decoding the Java-UUID file-id bits). Planning integration to auto-prune file groups on
+  record-key filters is the remaining step. _High / M._
 - **CDC read queries.** Parse `.cdc` log blocks and expose a change-feed query type. _High / M._
 - **Log-only file groups.** MOR slices with no base file currently error; unblocks tables written
   with certain configs. Contained, explicitly flagged P1. _Med / M._

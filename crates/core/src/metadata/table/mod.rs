@@ -23,6 +23,7 @@
 //! which stores file listings and other metadata for efficient table operations.
 
 pub mod column_stats;
+pub mod record_index;
 pub mod records;
 
 use std::collections::HashMap;

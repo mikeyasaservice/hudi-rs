@@ -47,8 +47,44 @@ use crate::statistics::{
     ColumnStatistics, StatisticsContainer, StatsGranularity, bytes_to_array, int32_to_array,
     int64_to_array,
 };
+use crate::storage::Storage;
 use crate::table::Table;
 use std::str::FromStr;
+
+/// List a metadata-table index partition and return the latest committed base HFile per
+/// file group (bucket), as of `latest_ts`.
+///
+/// Index partitions (`column_stats`, `partition_stats`, `record_index`) are bucketed into
+/// multiple file groups; each is read from its newest base HFile (a compaction). Shared by
+/// the stats and record-index readers.
+pub(crate) async fn latest_base_files_per_bucket(
+    storage: &Storage,
+    partition_name: &str,
+    latest_ts: &str,
+) -> Result<Vec<BaseFile>> {
+    let files = storage.list_files(Some(partition_name)).await?;
+    let mut latest: HashMap<String, BaseFile> = HashMap::new();
+    for file in &files {
+        if !file.name.ends_with(".hfile") {
+            continue;
+        }
+        let Ok(base_file) = BaseFile::from_str(&file.name) else {
+            continue;
+        };
+        if base_file.commit_timestamp.as_str() > latest_ts {
+            continue;
+        }
+        latest
+            .entry(base_file.file_id.clone())
+            .and_modify(|existing| {
+                if base_file.commit_timestamp > existing.commit_timestamp {
+                    *existing = base_file.clone();
+                }
+            })
+            .or_insert(base_file);
+    }
+    Ok(latest.into_values().collect())
+}
 
 /// Decoded statistics for one column of one data file from the `column_stats` partition.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,28 +112,34 @@ pub const COLUMN_STATS_PARTITION_NAME: &str = "column_stats";
 pub const PARTITION_STATS_PARTITION_NAME: &str = "partition_stats";
 
 /// Recursively unwrap Avro unions to reach the underlying value.
-fn unwrap_union(value: &AvroValue) -> &AvroValue {
+pub(crate) fn unwrap_union(value: &AvroValue) -> &AvroValue {
     match value {
         AvroValue::Union(_, inner) => unwrap_union(inner),
         other => other,
     }
 }
 
-fn find_field<'a>(fields: &'a [(String, AvroValue)], name: &str) -> Option<&'a AvroValue> {
+/// Look up a record field by name, unwrapping any surrounding union.
+pub(crate) fn find_field<'a>(
+    fields: &'a [(String, AvroValue)],
+    name: &str,
+) -> Option<&'a AvroValue> {
     fields
         .iter()
         .find(|(n, _)| n == name)
         .map(|(_, v)| unwrap_union(v))
 }
 
-fn extract_string(value: &AvroValue) -> Option<String> {
+/// Extract a string from an Avro value, unwrapping unions.
+pub(crate) fn extract_string(value: &AvroValue) -> Option<String> {
     match unwrap_union(value) {
         AvroValue::String(s) => Some(s.clone()),
         _ => None,
     }
 }
 
-fn extract_long(value: &AvroValue) -> Option<i64> {
+/// Extract an i64 from an Avro value (int or long), unwrapping unions.
+pub(crate) fn extract_long(value: &AvroValue) -> Option<i64> {
     match unwrap_union(value) {
         AvroValue::Long(n) => Some(*n),
         AvroValue::Int(n) => Some(*n as i64),
@@ -339,32 +381,10 @@ impl Table {
         };
 
         let storage = self.file_system_view.storage.as_ref();
-        let files = storage.list_files(Some(partition_name)).await?;
-
-        // Keep the latest committed base HFile per file group (bucket).
-        let mut latest_base_by_file_id: HashMap<String, BaseFile> = HashMap::new();
-        for file in &files {
-            if !file.name.ends_with(".hfile") {
-                continue;
-            }
-            let Ok(base_file) = BaseFile::from_str(&file.name) else {
-                continue;
-            };
-            if base_file.commit_timestamp.as_str() > latest_ts {
-                continue;
-            }
-            latest_base_by_file_id
-                .entry(base_file.file_id.clone())
-                .and_modify(|existing| {
-                    if base_file.commit_timestamp > existing.commit_timestamp {
-                        *existing = base_file.clone();
-                    }
-                })
-                .or_insert(base_file);
-        }
+        let base_files = latest_base_files_per_bucket(storage, partition_name, latest_ts).await?;
 
         let mut records: Vec<ColumnStatsRecord> = Vec::new();
-        for base_file in latest_base_by_file_id.values() {
+        for base_file in &base_files {
             let relative_path = format!("{partition_name}/{}", base_file.file_name());
             let mut reader = HFileReader::open(storage, &relative_path)
                 .await
