@@ -41,6 +41,18 @@ use crate::table::partition::PartitionPruner;
 use crate::timeline::view::TimelineView;
 use dashmap::DashMap;
 
+/// Pre-fetched metadata-table statistics used for planning-time pruning.
+///
+/// Both maps are empty when the metadata table is unavailable or the query has no
+/// data-column filters, in which case pruning falls back to Parquet footers.
+#[derive(Debug, Default)]
+pub(crate) struct MetadataStats {
+    /// Per-data-file column stats keyed by base file name (`column_stats` partition).
+    pub column_stats: HashMap<String, StatisticsContainer>,
+    /// Per-partition column stats keyed by partition path (`partition_stats` partition).
+    pub partition_stats: HashMap<String, StatisticsContainer>,
+}
+
 /// A view of the Hudi table's data files (files stored outside the `.hoodie/` directory) in the file system. It provides APIs to load and
 /// access the file groups and file slices.
 #[derive(Clone, Debug)]
@@ -89,10 +101,11 @@ impl FileSystemView {
     /// * `files_partition_records` - Optional pre-fetched metadata table records
     /// * `estimator` - Optional estimator used to populate `byte_size` and
     ///   `num_records` on base-file metadata for both MDT and storage-listing paths
-    /// * `mdt_column_stats` - Pre-fetched metadata table column stats keyed by base file
-    ///   name; empty when unavailable, in which case footer stats are used
+    /// * `mdt_stats` - Pre-fetched metadata table column/partition stats; empty when
+    ///   unavailable, in which case footer stats are used
     // Planning needs the partition/file pruners, schema, timeline, and both metadata-table
-    // sources (file listings and column stats) together; splitting them obscures the flow.
+    // sources (file listings and column/partition stats) together; splitting them obscures
+    // the flow.
     #[allow(clippy::too_many_arguments)]
     async fn load_file_groups(
         &self,
@@ -102,7 +115,7 @@ impl FileSystemView {
         timeline_view: &TimelineView,
         files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
         estimator: Option<&FileStatsEstimator>,
-        mdt_column_stats: &HashMap<String, StatisticsContainer>,
+        mdt_stats: &MetadataStats,
     ) -> Result<()> {
         let configured_base_file_format = self.configured_base_file_format()?;
 
@@ -133,6 +146,20 @@ impl FileSystemView {
                 continue;
             }
 
+            // Partition-level data skipping: if the partition's column stats prove no row
+            // can match the data-column filters, drop the whole partition before reading
+            // any files. Overwrite with an empty entry rather than skipping so a stale
+            // entry from a prior query on this reused view cannot leak through
+            // (collect_file_slices re-checks the partition pruner, but not partition stats).
+            // Partitions without stats are kept and handled per-file downstream.
+            if let Some(partition_stats) = mdt_stats.partition_stats.get(&partition_path)
+                && !file_pruner.should_include(partition_stats)
+            {
+                self.partition_to_file_groups
+                    .insert(partition_path, Vec::new());
+                continue;
+            }
+
             let retained = self
                 .apply_stats_pruning(
                     file_groups,
@@ -140,7 +167,7 @@ impl FileSystemView {
                     table_schema,
                     timeline_view.as_of_timestamp(),
                     configured_base_file_format.as_ref(),
-                    mdt_column_stats,
+                    &mdt_stats.column_stats,
                 )
                 .await;
             self.partition_to_file_groups
@@ -313,22 +340,37 @@ impl FileSystemView {
             None
         };
 
-        // When filtering, source column stats from the metadata table to skip files
-        // without per-file footer reads. Failures are non-fatal: fall back to footers.
-        let mdt_column_stats = match metadata_table {
+        // When filtering, source column/partition stats from the metadata table to skip
+        // files (and whole partitions) without per-file footer reads. Failures are
+        // non-fatal: fall back to footers.
+        let mdt_stats = match metadata_table {
             Some(mdt) if !file_pruner.is_empty() => {
-                match mdt.fetch_column_stats_containers(table_schema).await {
-                    Ok(stats) => stats,
-                    Err(e) => {
+                let column_stats = mdt
+                    .fetch_column_stats_containers(table_schema)
+                    .await
+                    .unwrap_or_else(|e| {
                         log::warn!(
                             "Failed to read column_stats from metadata table: {e}. \
                              Falling back to footer stats."
                         );
                         HashMap::new()
-                    }
+                    });
+                let partition_stats = mdt
+                    .fetch_partition_stats_containers(table_schema)
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::warn!(
+                            "Failed to read partition_stats from metadata table: {e}. \
+                             Skipping partition-level pruning."
+                        );
+                        HashMap::new()
+                    });
+                MetadataStats {
+                    column_stats,
+                    partition_stats,
                 }
             }
-            _ => HashMap::new(),
+            _ => MetadataStats::default(),
         };
 
         self.load_file_groups(
@@ -338,7 +380,7 @@ impl FileSystemView {
             timeline_view,
             files_partition_records.as_ref(),
             estimator,
-            &mdt_column_stats,
+            &mdt_stats,
         )
         .await?;
 
@@ -374,7 +416,7 @@ impl FileSystemView {
             timeline_view,
             None,
             estimator,
-            &HashMap::new(),
+            &MetadataStats::default(),
         )
         .await?;
 
@@ -672,7 +714,7 @@ mod tests {
                 &timeline_view,
                 Some(&records),
                 None,
-                &HashMap::new(),
+                &MetadataStats::default(),
             )
             .await
             .unwrap();
@@ -872,7 +914,7 @@ mod tests {
                 &timeline_view,
                 Some(&records),
                 None,
-                &HashMap::new(),
+                &MetadataStats::default(),
             )
             .await
             .unwrap();
@@ -1056,6 +1098,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fs_view_get_file_slices_prunes_partitions_via_partition_stats() {
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let hudi_table = Table::new(&table_path).await.unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
+        let timeline_view = hudi_table
+            .timeline
+            .create_view_as_of(&latest_timestamp)
+            .await
+            .unwrap();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema().await.unwrap();
+        let metadata_table = hudi_table.get_or_init_metadata_table().await.unwrap();
+        let all_partitions =
+            PartitionPruner::new(&[], &partition_schema, hudi_table.hudi_configs.as_ref()).unwrap();
+
+        // Per-partition `fare` ranges: chennai 41.06, sao_paulo 43.4, san_francisco up to
+        // 93.5. `fare > 50` lets the partition_stats index prune chennai and sao_paulo
+        // entirely, before any file in them is loaded.
+        let filters = vec![Filter::try_from(("fare", ">", "50")).unwrap()];
+        let file_pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+
+        let slices = hudi_table
+            .file_system_view
+            .get_file_slices(
+                &all_partitions,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                Some(metadata_table),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!slices.is_empty());
+        let returned: std::collections::HashSet<_> =
+            slices.iter().map(|s| s.partition_path.clone()).collect();
+        assert_eq!(
+            returned,
+            std::collections::HashSet::from(["city=san_francisco".to_string()])
+        );
+
+        // The pruned partitions carry no file groups (dropped at the partition level),
+        // while the surviving partition does.
+        let fs_view = &hudi_table.file_system_view;
+        assert!(
+            fs_view
+                .partition_to_file_groups
+                .get("city=chennai")
+                .map(|g| g.is_empty())
+                .unwrap_or(true),
+            "city=chennai should be pruned at the partition level"
+        );
+        assert!(
+            fs_view
+                .partition_to_file_groups
+                .get("city=sao_paulo")
+                .map(|g| g.is_empty())
+                .unwrap_or(true),
+            "city=sao_paulo should be pruned at the partition level"
+        );
+        assert!(
+            !fs_view
+                .partition_to_file_groups
+                .get("city=san_francisco")
+                .map(|g| g.is_empty())
+                .unwrap_or(true),
+            "city=san_francisco should survive partition pruning"
+        );
+    }
+
+    #[tokio::test]
     async fn fs_view_get_file_slices_by_storage_listing() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
@@ -1144,7 +1258,7 @@ mod tests {
                 &timeline_view,
                 None,
                 None,
-                &HashMap::new(),
+                &MetadataStats::default(),
             )
             .await;
 

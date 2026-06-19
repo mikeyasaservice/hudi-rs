@@ -61,9 +61,9 @@ that exists today.
 | Timeline actions | ◑ Partial | Only `commit` / `deltacommit` / `replacecommit` loaded (`timeline/mod.rs`); no clean/compaction/clustering/rollback/savepoint/restore/indexing |
 | LSM archived timeline | ✗ Stub | v2 history reader returns empty (`timeline/loader.rs:256`) |
 | Merge strategies | ◑ Partial | `AppendOnly`, `OverwriteWithLatest`; **single ordering field only** (`config/table.rs:267`) |
-| Metadata table | ◑ Partial | `files` + `column_stats` partitions read (`metadata/table/column_stats.rs`); `bloom_filters`/`record_index`/`partition_stats` enums defined but unused |
+| Metadata table | ◑ Partial | `files` + `column_stats` + `partition_stats` partitions read (`metadata/table/column_stats.rs`); `bloom_filters`/`record_index` enums defined but unused |
 | HFile reader | ✓ Complete | `crates/core/src/hfile/`; powers the MDT |
-| Data skipping | ◑ Partial | MDT `column_stats` index used at planning time when available (`metadata/table/column_stats.rs`, wired in `table/fs_view.rs`), falling back to per-file Parquet footers (`table/file_pruner.rs`); base-HFile sourced only (post-compaction delta logs not yet read) |
+| Data skipping | ◑ Partial | MDT `column_stats` (per-file) and `partition_stats` (per-partition) indexes used at planning time when available (`metadata/table/column_stats.rs`, wired in `table/fs_view.rs`), falling back to per-file Parquet footers (`table/file_pruner.rs`); base-HFile sourced only (post-compaction delta logs not yet read) |
 | Partition pruning | ✓ Complete | Hive-style + standard paths (`table/partition.rs`) |
 | Key generators | ◑ Partial | `TimestampBased` complete; Simple/Complex detection-only |
 | Base file formats | ◑ Partial | Parquet (+ experimental Lance); ORC rejected (`config/table.rs:455`); HFile for MDT only |
@@ -85,7 +85,11 @@ that exists today.
   the `column_stats` base HFiles are decoded into per-file `StatisticsContainer`s and fed to
   `FilePruner`, skipping files without a footer read. Remaining: source stats from
   post-compaction delta logs, and add IN/NOT-IN + decimal support. _High / M._
-- **MDT partition-stats partition → partition pruning** without listing. _Med / M._
+- **MDT partition-stats partition → partition pruning** without listing.
+  _Landed_ (`metadata/table/column_stats.rs`, wired in `table/fs_view.rs`): the `partition_stats`
+  base HFiles (same payload as column stats, aggregated per partition) are decoded into
+  per-partition `StatisticsContainer`s and fed to `FilePruner` to drop whole partitions before
+  any file in them is read. _Med / M._
 - **MDT record-level index (RLI) → point lookups** for equality on record keys; large win for
   engines pushing key predicates. _High / M._
 - **CDC read queries.** Parse `.cdc` log blocks and expose a change-feed query type. _High / M._

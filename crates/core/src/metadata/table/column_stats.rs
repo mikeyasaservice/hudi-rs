@@ -69,8 +69,11 @@ pub struct ColumnStatsRecord {
     pub is_deleted: bool,
 }
 
-/// The metadata table partition name that stores column statistics.
+/// The metadata table partition name that stores per-file column statistics.
 pub const COLUMN_STATS_PARTITION_NAME: &str = "column_stats";
+
+/// The metadata table partition name that stores per-partition column statistics.
+pub const PARTITION_STATS_PARTITION_NAME: &str = "partition_stats";
 
 /// Recursively unwrap Avro unions to reach the underlying value.
 fn unwrap_union(value: &AvroValue) -> &AvroValue {
@@ -209,10 +212,12 @@ fn avro_scalar_to_array(scalar: &AvroValue, data_type: &DataType) -> Option<Arra
     }
 }
 
-/// Group decoded column-stats records into per-file [`StatisticsContainer`]s.
+/// Group decoded column-stats records into [`StatisticsContainer`]s keyed by each
+/// record's subject — the data file name for `column_stats`, or the partition path for
+/// `partition_stats` (both live in the record's `file_name` field).
 ///
 /// Records whose column is absent from `schema`, or that are tombstones, are skipped.
-/// The returned map is keyed by data file name and is directly consumable by
+/// The returned map is directly consumable by
 /// [`crate::table::file_pruner::FilePruner::should_include`].
 pub fn column_stats_to_containers(
     records: &[ColumnStatsRecord],
@@ -275,17 +280,58 @@ impl Table {
         metadata_table.fetch_column_stats_containers(schema).await
     }
 
-    /// Fetch and decode the `column_stats` records from the latest committed base HFile
-    /// of each file group in the partition, grouping the result into per-file containers.
+    /// Read the metadata table `partition_stats` partition into per-partition statistics,
+    /// typed against `schema` (the data table schema).
     ///
-    /// The partition is bucketed into multiple file groups, each a base HFile (produced by
-    /// metadata-table compaction) plus delta log files. Only the base HFiles are read here;
-    /// stats carried solely by post-compaction delta logs are not yet sourced, but files
-    /// they would cover fall back to footer-based pruning, which is safe. Reading the base
-    /// HFiles directly also sidesteps log-only file slices, which the file-group builder
-    /// does not yet support. Must be called on a METADATA table.
+    /// The `partition_stats` partition reuses the column-stats payload but aggregates each
+    /// column's min/max per data table partition; the returned map is therefore keyed by
+    /// partition path and is consumable by
+    /// [`crate::table::file_pruner::FilePruner::should_include`] to skip whole partitions.
+    ///
+    /// Must be called on a DATA table, not a METADATA table.
+    pub async fn read_metadata_table_partition_stats(
+        &self,
+        schema: &Schema,
+    ) -> Result<HashMap<String, StatisticsContainer>> {
+        let metadata_table = self.get_or_init_metadata_table().await?;
+        metadata_table
+            .fetch_partition_stats_containers(schema)
+            .await
+    }
+
+    /// Fetch and group the `column_stats` records into per-data-file containers.
     pub(crate) async fn fetch_column_stats_containers(
         &self,
+        schema: &Schema,
+    ) -> Result<HashMap<String, StatisticsContainer>> {
+        self.fetch_index_stats_containers(COLUMN_STATS_PARTITION_NAME, schema)
+            .await
+    }
+
+    /// Fetch and group the `partition_stats` records into per-partition containers.
+    pub(crate) async fn fetch_partition_stats_containers(
+        &self,
+        schema: &Schema,
+    ) -> Result<HashMap<String, StatisticsContainer>> {
+        self.fetch_index_stats_containers(PARTITION_STATS_PARTITION_NAME, schema)
+            .await
+    }
+
+    /// Fetch and decode the column-stats records from the latest committed base HFile of
+    /// each file group in the given index partition (`column_stats` or `partition_stats`),
+    /// grouping them into statistics containers keyed by the record's subject (data file
+    /// name for `column_stats`, partition path for `partition_stats`).
+    ///
+    /// Each index partition is bucketed into multiple file groups, each a base HFile
+    /// (produced by metadata-table compaction) plus delta log files. Only the base HFiles
+    /// are read here; stats carried solely by post-compaction delta logs are not yet
+    /// sourced, but the subjects they would cover fall back to footer-based pruning (for
+    /// `column_stats`) or to being kept (for `partition_stats`), which is safe. Reading the
+    /// base HFiles directly also sidesteps log-only file slices, which the file-group
+    /// builder does not yet support. Must be called on a METADATA table.
+    async fn fetch_index_stats_containers(
+        &self,
+        partition_name: &str,
         schema: &Schema,
     ) -> Result<HashMap<String, StatisticsContainer>> {
         let Some(latest_ts) = self.timeline.get_latest_commit_timestamp_as_option() else {
@@ -293,9 +339,7 @@ impl Table {
         };
 
         let storage = self.file_system_view.storage.as_ref();
-        let files = storage
-            .list_files(Some(COLUMN_STATS_PARTITION_NAME))
-            .await?;
+        let files = storage.list_files(Some(partition_name)).await?;
 
         // Keep the latest committed base HFile per file group (bucket).
         let mut latest_base_by_file_id: HashMap<String, BaseFile> = HashMap::new();
@@ -321,25 +365,27 @@ impl Table {
 
         let mut records: Vec<ColumnStatsRecord> = Vec::new();
         for base_file in latest_base_by_file_id.values() {
-            let relative_path = format!("{COLUMN_STATS_PARTITION_NAME}/{}", base_file.file_name());
+            let relative_path = format!("{partition_name}/{}", base_file.file_name());
             let mut reader = HFileReader::open(storage, &relative_path)
                 .await
                 .map_err(|e| {
                     CoreError::MetadataTable(format!(
-                        "Failed to open column_stats base file {relative_path}: {e:?}"
+                        "Failed to open {partition_name} base file {relative_path}: {e:?}"
                     ))
                 })?;
             let avro_schema = reader
                 .get_avro_schema()
                 .map_err(|e| {
-                    CoreError::MetadataTable(format!("Failed to get column_stats schema: {e:?}"))
+                    CoreError::MetadataTable(format!(
+                        "Failed to get {partition_name} schema: {e:?}"
+                    ))
                 })?
                 .cloned();
             let Some(avro_schema) = avro_schema else {
                 continue;
             };
             let hfile_records = reader.collect_records().map_err(|e| {
-                CoreError::MetadataTable(format!("Failed to read column_stats records: {e:?}"))
+                CoreError::MetadataTable(format!("Failed to read {partition_name} records: {e:?}"))
             })?;
             for record in hfile_records {
                 if let Some(decoded) =
@@ -534,6 +580,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_metadata_table_partition_stats_via_table_api() {
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let schema = table.get_schema().await.unwrap();
+
+        let containers = table
+            .read_metadata_table_partition_stats(&schema)
+            .await
+            .unwrap();
+
+        // Keyed by partition path (not data file name).
+        assert!(containers.contains_key("city=chennai"));
+        assert!(containers.contains_key("city=san_francisco"));
+        assert!(containers.contains_key("city=sao_paulo"));
+        // Per-partition aggregates exist for data columns.
+        let sf = containers.get("city=san_francisco").unwrap();
+        assert!(
+            sf.columns
+                .get("fare")
+                .map(|s| s.min_value.is_some() && s.max_value.is_some())
+                .unwrap_or(false),
+            "expected fare min/max for city=san_francisco"
+        );
     }
 
     #[test]
