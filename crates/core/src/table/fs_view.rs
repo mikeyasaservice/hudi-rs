@@ -31,6 +31,7 @@ use crate::file_group::base_file::reader::BaseFileReader;
 use crate::file_group::builder::file_groups_from_files_partition_records;
 use crate::file_group::file_slice::FileSlice;
 use crate::metadata::table::records::FilesPartitionRecord;
+use crate::statistics::StatisticsContainer;
 use crate::statistics::estimator::FileStatsEstimator;
 use crate::storage::Storage;
 use crate::table::Table;
@@ -75,10 +76,10 @@ impl FileSystemView {
     /// - If `files_partition_records` is None: Uses storage listing via FileLister
     ///
     /// # Stats Pruning Source (for non-empty file_pruner)
-    /// - Currently: Always extracts stats from Parquet file footers
-    /// - TODO: Use metadata table partitions when available:
-    ///   - partition_stats: Enhance PartitionPruner to prune partitions before file listing
-    ///   - column_stats: Prune files without reading Parquet footers
+    /// - When `mdt_column_stats` has an entry for a file: prunes using the metadata
+    ///   table column-stats index, avoiding a Parquet footer read.
+    /// - Otherwise: falls back to extracting stats from the Parquet file footer.
+    /// - TODO: Use partition_stats to prune partitions before file listing.
     ///
     /// # Arguments
     /// * `partition_pruner` - Filters which partitions to include
@@ -88,6 +89,11 @@ impl FileSystemView {
     /// * `files_partition_records` - Optional pre-fetched metadata table records
     /// * `estimator` - Optional estimator used to populate `byte_size` and
     ///   `num_records` on base-file metadata for both MDT and storage-listing paths
+    /// * `mdt_column_stats` - Pre-fetched metadata table column stats keyed by base file
+    ///   name; empty when unavailable, in which case footer stats are used
+    // Planning needs the partition/file pruners, schema, timeline, and both metadata-table
+    // sources (file listings and column stats) together; splitting them obscures the flow.
+    #[allow(clippy::too_many_arguments)]
     async fn load_file_groups(
         &self,
         partition_pruner: &PartitionPruner,
@@ -96,6 +102,7 @@ impl FileSystemView {
         timeline_view: &TimelineView,
         files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
         estimator: Option<&FileStatsEstimator>,
+        mdt_column_stats: &HashMap<String, StatisticsContainer>,
     ) -> Result<()> {
         let configured_base_file_format = self.configured_base_file_format()?;
 
@@ -127,12 +134,13 @@ impl FileSystemView {
             }
 
             let retained = self
-                .apply_stats_pruning_from_footers(
+                .apply_stats_pruning(
                     file_groups,
                     file_pruner,
                     table_schema,
                     timeline_view.as_of_timestamp(),
                     configured_base_file_format.as_ref(),
+                    mdt_column_stats,
                 )
                 .await;
             self.partition_to_file_groups
@@ -142,30 +150,33 @@ impl FileSystemView {
         Ok(())
     }
 
-    /// Apply file-level stats pruning using Parquet file footers.
+    /// Apply file-level stats pruning, preferring the metadata table column-stats index
+    /// over Parquet file footers.
     ///
-    /// Returns the filtered list of file groups that pass the pruning check.
+    /// For each file, if `mdt_column_stats` has an entry (keyed by base file name) it is
+    /// used for the prune decision, avoiding a footer read; otherwise the Parquet footer
+    /// is read. Returns the filtered list of file groups that pass the pruning check.
     /// Files are included (not pruned) if:
     /// - The pruner has no filters
     /// - The table's base file format does not support footer stats
     /// - The file does not match the configured base file extension
     /// - Column stats cannot be loaded (conservative behavior)
     /// - The file's stats indicate it might contain matching rows
-    async fn apply_stats_pruning_from_footers(
+    async fn apply_stats_pruning(
         &self,
         file_groups: Vec<FileGroup>,
         file_pruner: &FilePruner,
         table_schema: &Schema,
         as_of_timestamp: &str,
         configured_base_file_format: Option<&BaseFileFormatValue>,
+        mdt_column_stats: &HashMap<String, StatisticsContainer>,
     ) -> Vec<FileGroup> {
         if file_pruner.is_empty() {
             return file_groups;
         }
 
-        // Footer-based column-stats pruning only applies to Parquet base files.
-        // (Separate concern from the FileStatsEstimator parquet check, which lives
-        // on Table::get_or_init_estimator.)
+        // Column-stats pruning only applies to Parquet base files. (Separate concern from
+        // the FileStatsEstimator parquet check, which lives on Table::get_or_init_estimator.)
         if configured_base_file_format.is_some_and(|f| !matches!(f, BaseFileFormatValue::Parquet)) {
             return file_groups;
         }
@@ -188,6 +199,23 @@ impl FileSystemView {
 
                 if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
                     retained.push(fg);
+                    continue;
+                }
+
+                // Prefer the metadata table column-stats index to avoid a footer read.
+                let base_file_name = relative_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(relative_path.as_str());
+                if let Some(col_stats) = mdt_column_stats.get(base_file_name) {
+                    if file_pruner.should_include(col_stats) {
+                        fsl.base_file_column_stats = Some(col_stats.clone());
+                        retained.push(fg);
+                    } else {
+                        log::debug!(
+                            "Pruned file {relative_path} based on metadata table column stats"
+                        );
+                    }
                     continue;
                 }
 
@@ -285,6 +313,24 @@ impl FileSystemView {
             None
         };
 
+        // When filtering, source column stats from the metadata table to skip files
+        // without per-file footer reads. Failures are non-fatal: fall back to footers.
+        let mdt_column_stats = match metadata_table {
+            Some(mdt) if !file_pruner.is_empty() => {
+                match mdt.fetch_column_stats_containers(table_schema).await {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to read column_stats from metadata table: {e}. \
+                             Falling back to footer stats."
+                        );
+                        HashMap::new()
+                    }
+                }
+            }
+            _ => HashMap::new(),
+        };
+
         self.load_file_groups(
             partition_pruner,
             file_pruner,
@@ -292,6 +338,7 @@ impl FileSystemView {
             timeline_view,
             files_partition_records.as_ref(),
             estimator,
+            &mdt_column_stats,
         )
         .await?;
 
@@ -317,7 +364,9 @@ impl FileSystemView {
         timeline_view: &TimelineView,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
-        // Pass None to force storage listing (avoids recursion for metadata table)
+        // Pass None to force storage listing (avoids recursion for metadata table).
+        // Storage-listing reads never source column stats from the metadata table —
+        // this path also serves the metadata table's own file listing.
         self.load_file_groups(
             partition_pruner,
             file_pruner,
@@ -325,6 +374,7 @@ impl FileSystemView {
             timeline_view,
             None,
             estimator,
+            &HashMap::new(),
         )
         .await?;
 
@@ -622,6 +672,7 @@ mod tests {
                 &timeline_view,
                 Some(&records),
                 None,
+                &HashMap::new(),
             )
             .await
             .unwrap();
@@ -655,12 +706,13 @@ mod tests {
             FileGroup::new_with_base_file_name("fileid_0-0-1_20240418173551906.parquet", "")
                 .unwrap();
         let retained = fs_view
-            .apply_stats_pruning_from_footers(
+            .apply_stats_pruning(
                 vec![file_group],
                 &file_pruner,
                 &table_schema,
                 &as_of,
                 Some(&BaseFileFormatValue::HFile),
+                &HashMap::new(),
             )
             .await;
 
@@ -676,12 +728,13 @@ mod tests {
             FileGroup::new_with_base_file_name("fileid_0-0-1_20240418173551906.hfile", "").unwrap();
         let retained = table
             .file_system_view
-            .apply_stats_pruning_from_footers(
+            .apply_stats_pruning(
                 vec![file_group],
                 &file_pruner,
                 &table_schema,
                 &as_of,
                 None,
+                &HashMap::new(),
             )
             .await;
 
@@ -819,6 +872,7 @@ mod tests {
                 &timeline_view,
                 Some(&records),
                 None,
+                &HashMap::new(),
             )
             .await
             .unwrap();
@@ -849,12 +903,13 @@ mod tests {
         .unwrap();
         let retained = hudi_table
             .file_system_view
-            .apply_stats_pruning_from_footers(
+            .apply_stats_pruning(
                 vec![missing_file_group],
                 &file_pruner,
                 &table_schema,
                 &as_of,
                 Some(&BaseFileFormatValue::Parquet),
+                &HashMap::new(),
             )
             .await;
 
@@ -873,12 +928,13 @@ mod tests {
         .unwrap();
         let retained = hudi_table
             .file_system_view
-            .apply_stats_pruning_from_footers(
+            .apply_stats_pruning(
                 vec![file_group],
                 &file_pruner,
                 &table_schema,
                 &as_of,
                 Some(&BaseFileFormatValue::Parquet),
+                &HashMap::new(),
             )
             .await;
 
@@ -897,12 +953,13 @@ mod tests {
         .unwrap();
         let retained = hudi_table
             .file_system_view
-            .apply_stats_pruning_from_footers(
+            .apply_stats_pruning(
                 vec![file_group],
                 &file_pruner,
                 &table_schema,
                 "19700101000000",
                 Some(&BaseFileFormatValue::Parquet),
+                &HashMap::new(),
             )
             .await;
 
@@ -940,6 +997,62 @@ mod tests {
             .unwrap();
 
         assert!(!file_slices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fs_view_get_file_slices_prunes_via_metadata_column_stats() {
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let hudi_table = Table::new(&table_path).await.unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
+        let timeline_view = hudi_table
+            .timeline
+            .create_view_as_of(&latest_timestamp)
+            .await
+            .unwrap();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema().await.unwrap();
+        let metadata_table = hudi_table.get_or_init_metadata_table().await.unwrap();
+        let all_partitions =
+            PartitionPruner::new(&[], &partition_schema, hudi_table.hudi_configs.as_ref()).unwrap();
+
+        // Baseline: no file filter returns the table's file slices.
+        let baseline = hudi_table
+            .file_system_view
+            .get_file_slices(
+                &all_partitions,
+                &FilePruner::empty(),
+                &table_schema,
+                &timeline_view,
+                Some(metadata_table),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!baseline.is_empty());
+
+        // A `driver` value above every file's max prunes all files using the metadata
+        // table column-stats index (driver is a data column, not a partition column).
+        let filters = vec![Filter::try_from(("driver", "=", "zzzzzzzz")).unwrap()];
+        let file_pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+        assert!(!file_pruner.is_empty());
+
+        let pruned = hudi_table
+            .file_system_view
+            .get_file_slices(
+                &all_partitions,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                Some(metadata_table),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            pruned.is_empty(),
+            "all files should be pruned by column stats for driver='zzzzzzzz', got {} slices",
+            pruned.len()
+        );
     }
 
     #[tokio::test]
@@ -983,12 +1096,13 @@ mod tests {
         .unwrap();
         let retained = hudi_table
             .file_system_view
-            .apply_stats_pruning_from_footers(
+            .apply_stats_pruning(
                 vec![file_group],
                 &file_pruner,
                 &table_schema,
                 &as_of,
                 None,
+                &HashMap::new(),
             )
             .await;
 
@@ -1030,6 +1144,7 @@ mod tests {
                 &timeline_view,
                 None,
                 None,
+                &HashMap::new(),
             )
             .await;
 

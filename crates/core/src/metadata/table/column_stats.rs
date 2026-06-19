@@ -39,12 +39,16 @@ use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array};
 use arrow_schema::{DataType, Schema};
 
 use crate::Result;
-use crate::hfile::HFileRecord;
+use crate::error::CoreError;
+use crate::file_group::base_file::BaseFile;
+use crate::hfile::{HFileReader, HFileRecord};
 use crate::metadata::table::records::decode_avro_value;
 use crate::statistics::{
     ColumnStatistics, StatisticsContainer, StatsGranularity, bytes_to_array, int32_to_array,
     int64_to_array,
 };
+use crate::table::Table;
+use std::str::FromStr;
 
 /// Decoded statistics for one column of one data file from the `column_stats` partition.
 #[derive(Debug, Clone, PartialEq)]
@@ -254,6 +258,102 @@ pub fn column_stats_to_containers(
     out
 }
 
+impl Table {
+    /// Read the metadata table `column_stats` partition into per-data-file statistics,
+    /// typed against `schema` (the data table schema).
+    ///
+    /// The returned map is keyed by base data file name and is directly consumable by
+    /// [`crate::table::file_pruner::FilePruner::should_include`]. Returns an empty map
+    /// when the table has no completed commits or the metadata table is not enabled.
+    ///
+    /// Must be called on a DATA table, not a METADATA table.
+    pub async fn read_metadata_table_column_stats(
+        &self,
+        schema: &Schema,
+    ) -> Result<HashMap<String, StatisticsContainer>> {
+        let metadata_table = self.get_or_init_metadata_table().await?;
+        metadata_table.fetch_column_stats_containers(schema).await
+    }
+
+    /// Fetch and decode the `column_stats` records from the latest committed base HFile
+    /// of each file group in the partition, grouping the result into per-file containers.
+    ///
+    /// The partition is bucketed into multiple file groups, each a base HFile (produced by
+    /// metadata-table compaction) plus delta log files. Only the base HFiles are read here;
+    /// stats carried solely by post-compaction delta logs are not yet sourced, but files
+    /// they would cover fall back to footer-based pruning, which is safe. Reading the base
+    /// HFiles directly also sidesteps log-only file slices, which the file-group builder
+    /// does not yet support. Must be called on a METADATA table.
+    pub(crate) async fn fetch_column_stats_containers(
+        &self,
+        schema: &Schema,
+    ) -> Result<HashMap<String, StatisticsContainer>> {
+        let Some(latest_ts) = self.timeline.get_latest_commit_timestamp_as_option() else {
+            return Ok(HashMap::new());
+        };
+
+        let storage = self.file_system_view.storage.as_ref();
+        let files = storage
+            .list_files(Some(COLUMN_STATS_PARTITION_NAME))
+            .await?;
+
+        // Keep the latest committed base HFile per file group (bucket).
+        let mut latest_base_by_file_id: HashMap<String, BaseFile> = HashMap::new();
+        for file in &files {
+            if !file.name.ends_with(".hfile") {
+                continue;
+            }
+            let Ok(base_file) = BaseFile::from_str(&file.name) else {
+                continue;
+            };
+            if base_file.commit_timestamp.as_str() > latest_ts {
+                continue;
+            }
+            latest_base_by_file_id
+                .entry(base_file.file_id.clone())
+                .and_modify(|existing| {
+                    if base_file.commit_timestamp > existing.commit_timestamp {
+                        *existing = base_file.clone();
+                    }
+                })
+                .or_insert(base_file);
+        }
+
+        let mut records: Vec<ColumnStatsRecord> = Vec::new();
+        for base_file in latest_base_by_file_id.values() {
+            let relative_path = format!("{COLUMN_STATS_PARTITION_NAME}/{}", base_file.file_name());
+            let mut reader = HFileReader::open(storage, &relative_path)
+                .await
+                .map_err(|e| {
+                    CoreError::MetadataTable(format!(
+                        "Failed to open column_stats base file {relative_path}: {e:?}"
+                    ))
+                })?;
+            let avro_schema = reader
+                .get_avro_schema()
+                .map_err(|e| {
+                    CoreError::MetadataTable(format!("Failed to get column_stats schema: {e:?}"))
+                })?
+                .cloned();
+            let Some(avro_schema) = avro_schema else {
+                continue;
+            };
+            let hfile_records = reader.collect_records().map_err(|e| {
+                CoreError::MetadataTable(format!("Failed to read column_stats records: {e:?}"))
+            })?;
+            for record in hfile_records {
+                if let Some(decoded) =
+                    decode_column_stats_record_with_schema(&record, &avro_schema)?
+                {
+                    records.push(decoded);
+                }
+            }
+        }
+
+        Ok(column_stats_to_containers(&records, schema))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +496,44 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_metadata_table_column_stats_via_table_api() {
+        // Exercises the full pipeline: bucketed multi-slice read of the column_stats
+        // partition (base HFiles + log files), key-dedup merge, decode, and grouping.
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let schema = table.get_schema().await.unwrap();
+
+        let containers = table
+            .read_metadata_table_column_stats(&schema)
+            .await
+            .unwrap();
+
+        assert!(!containers.is_empty(), "expected per-file column stats");
+        // Stats are keyed by base data file name.
+        assert!(
+            containers.keys().any(|k| k.ends_with(".parquet")),
+            "expected stats keyed by parquet file names, got: {:?}",
+            containers.keys().collect::<Vec<_>>()
+        );
+        // At least one file has a column with usable min/max.
+        assert!(
+            containers
+                .values()
+                .any(|c| c.columns.values().any(|s| s.min_value.is_some())),
+            "expected at least one column with a min value"
+        );
+        // Every recorded column belongs to the data schema.
+        for container in containers.values() {
+            for col in container.columns.keys() {
+                assert!(
+                    schema.field_with_name(col).is_ok(),
+                    "stats column {col} should exist in the table schema"
+                );
+            }
+        }
     }
 
     #[test]
