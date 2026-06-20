@@ -98,7 +98,6 @@ pub use crate::config::read_options::{QueryType, ReadOptions};
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
 use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
@@ -412,8 +411,7 @@ impl Table {
             )]));
         }
 
-        let partition_field_names: Vec<String> =
-            self.hudi_configs.get_or_default(PartitionFields).into();
+        let partition_field_names = crate::keygen::partition_column_names(&self.hudi_configs);
 
         let schema = self.get_schema().await?;
         project_partition_schema(&schema, &partition_field_names)

@@ -491,9 +491,8 @@ impl FileGroupReader {
             .get_or_default(HudiTableConfig::DropsPartitionFields)
             .into();
         let dropped_partition_columns: Vec<String> = if drops_partition_columns {
-            self.hudi_configs
-                .get_or_default(HudiTableConfig::PartitionFields)
-                .into()
+            // Strip any CustomKeyGenerator `field:TYPE` suffixes so the names match data columns.
+            crate::keygen::partition_column_names(&self.hudi_configs)
         } else {
             Vec::new()
         };
