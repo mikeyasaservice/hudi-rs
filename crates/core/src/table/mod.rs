@@ -1797,7 +1797,7 @@ mod tests {
         assert_eq!(p10.len(), 1, "Partition 10 should have 1 file slice");
         let file_slice = p10[0];
         assert_eq!(
-            file_slice.base_file.file_name(),
+            file_slice.base_file.as_ref().unwrap().file_name(),
             "92e64357-e4d1-4639-a9d3-c3535829d0aa-0_1-53-79_20250121000647668.parquet"
         );
         assert_eq!(file_slice.log_files.len(), 1);
@@ -1938,17 +1938,35 @@ mod tests {
         // size comes from HoodieWriteStat.fileSizeInBytes; byte_size and num_records
         // are estimated from the cached FileStatsEstimator (seeded from a sample
         // base file in commit metadata at or before end_timestamp).
-        let m0 = file_slice_0.base_file.file_metadata.as_ref().unwrap();
+        let m0 = file_slice_0
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m0.size, 440878);
         assert_eq!(m0.byte_size, 326703);
         assert_eq!(m0.num_records, 458);
 
-        let m1 = file_slice_1.base_file.file_metadata.as_ref().unwrap();
+        let m1 = file_slice_1
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m1.size, 440616);
         assert_eq!(m1.byte_size, 326509);
         assert_eq!(m1.num_records, 458);
 
-        let m2 = file_slice_2.base_file.file_metadata.as_ref().unwrap();
+        let m2 = file_slice_2
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m2.size, 440638);
         assert_eq!(m2.byte_size, 326525);
         assert_eq!(m2.num_records, 458);
@@ -2201,7 +2219,13 @@ mod tests {
 
         // Verify file metadata is populated from MDT with estimated stats
         for fsl in &file_slices {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }

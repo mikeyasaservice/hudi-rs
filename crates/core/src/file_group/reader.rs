@@ -207,7 +207,6 @@ impl FileGroupReader {
         file_slice: &FileSlice,
         options: &ReadOptions,
     ) -> Result<RecordBatch> {
-        let base_file_path = file_slice.base_file_relative_path()?;
         let log_file_paths = if file_slice.has_log_file() {
             file_slice
                 .log_files
@@ -217,8 +216,47 @@ impl FileGroupReader {
         } else {
             vec![]
         };
+        if !file_slice.has_base_file() {
+            return self.read_log_only(log_file_paths, options).await;
+        }
+        let base_file_path = file_slice.base_file_relative_path()?;
         self.read_file_slice_from_paths(&base_file_path, log_file_paths, options)
             .await
+    }
+
+    /// Read a log-only file slice (no base file): scan and merge the log files alone.
+    ///
+    /// The merge schema is taken from the first log data block. Returns an error if the
+    /// scan yields no data records (e.g. delete-only or fully filtered), since there is no
+    /// base file to supply the schema.
+    async fn read_log_only(
+        &self,
+        log_file_paths: Vec<String>,
+        options: &ReadOptions,
+    ) -> Result<RecordBatch> {
+        let options = self.resolve_read_options(options)?;
+        let instant_range = self.create_instant_range_for_log_file_scan()?;
+        let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            .scan(log_file_paths, &instant_range)
+            .await?;
+        let log_batches = match scan_result {
+            ScanResult::RecordBatches(batches) => batches,
+            ScanResult::Empty => RecordBatches::new(),
+            ScanResult::HFileRecords(_) => {
+                return Err(CoreError::LogBlockError(
+                    "Unexpected HFile records in regular table log file".to_string(),
+                ));
+            }
+        };
+
+        let Some(schema) = log_batches.data_batches.first().map(|b| b.schema()) else {
+            return Err(ReadFileSliceError(
+                "Log-only file slice produced no data records to derive a schema".to_string(),
+            ));
+        };
+        let merger = RecordMerger::new(schema, self.hudi_configs.clone());
+        let merged = merger.merge_record_batches(log_batches)?;
+        apply_eager_options(&options, merged)
     }
 
     /// Reads a file slice from a base file and a list of log files.
@@ -319,12 +357,6 @@ impl FileGroupReader {
         file_slice: &FileSlice,
         options: &ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let base_file_path = file_slice.base_file_relative_path()?;
-        let known_base_file_size = file_slice
-            .base_file
-            .file_metadata
-            .as_ref()
-            .map(|metadata| metadata.size);
         let log_file_paths: Vec<String> = if file_slice.has_log_file() {
             file_slice
                 .log_files
@@ -334,6 +366,20 @@ impl FileGroupReader {
         } else {
             vec![]
         };
+
+        // Log-only slices have no base file to stream; collect-and-merge the logs and yield
+        // the result as a single batch (same fallback used for MOR slices with log files).
+        if !file_slice.has_base_file() {
+            let batch = self.read_log_only(log_file_paths, options).await?;
+            return Ok(Box::pin(futures::stream::once(async move { Ok(batch) })));
+        }
+
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let known_base_file_size = file_slice
+            .base_file
+            .as_ref()
+            .and_then(|bf| bf.file_metadata.as_ref())
+            .map(|metadata| metadata.size);
 
         self.read_file_slice_from_paths_stream_inner(
             &base_file_path,
@@ -743,6 +789,7 @@ mod tests {
     use crate::error::CoreError;
     use crate::file_group::base_file::BaseFile;
     use crate::file_group::file_slice::FileSlice;
+    use crate::file_group::log_file::LogFile;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -962,6 +1009,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_log_only_file_slice_with_real_log_files() -> Result<()> {
+        use futures::StreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        // Read a log-only file slice (no base file) built from real chennai delta log files.
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let base_url = Url::from_directory_path(&table_path).unwrap();
+        let reader = FileGroupReader::new_with_options(base_url.as_str(), empty_options()).await?;
+
+        let mut file_slice = FileSlice::new_log_only("city=chennai".to_string());
+        for name in [
+            ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210127080.log.1_0-1072-3078",
+            ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210128625.log.1_0-1097-3150",
+        ] {
+            file_slice.log_files.insert(LogFile::from_str(name)?);
+        }
+        assert!(!file_slice.has_base_file());
+        assert_eq!(
+            file_slice.file_id(),
+            "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0"
+        );
+
+        // The log-only read path scans and merges the logs with no base file, producing a
+        // batch with the table's data schema (derived from the log data blocks).
+        let batch = reader
+            .read_file_slice(&file_slice, &ReadOptions::new())
+            .await?;
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            field_names.contains(&"uuid") && field_names.contains(&"rider"),
+            "log-only read should expose the table's columns, got {field_names:?}"
+        );
+
+        // Streaming a log-only slice falls back to a single merged batch with the same rows.
+        let mut stream = reader
+            .read_file_slice_stream(&file_slice, &ReadOptions::new())
+            .await?;
+        let mut streamed_rows = 0usize;
+        while let Some(b) = stream.next().await {
+            streamed_rows += b?.num_rows();
+        }
+        assert_eq!(streamed_rows, batch.num_rows());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_read_file_slice_from_paths_read_optimized_ignores_log_files() -> Result<()> {
         // In read-optimized mode the log file paths must be ignored. We pass a
         // bogus log path; the call would error if it were not skipped.
@@ -1167,7 +1261,7 @@ mod tests {
 
         // Sanity-check: same call without populated metadata reads the same rows.
         let mut bare_slice = file_slice.clone();
-        bare_slice.base_file.file_metadata = None;
+        bare_slice.base_file.as_mut().unwrap().file_metadata = None;
         let bare_total: usize = {
             let mut s = reader.read_file_slice_stream(&bare_slice, &options).await?;
             let mut sum = 0;

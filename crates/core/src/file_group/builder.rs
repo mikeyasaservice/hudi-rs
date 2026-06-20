@@ -279,9 +279,7 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
             // Skip files with unrecognized extensions
         }
 
-        // Build FileGroups from parsed files
-        // Note: Currently only supports file groups with base files.
-        // TODO: Support file groups with only log files (P1 task)
+        // Build FileGroups from parsed files.
         let mut file_groups = Vec::new();
         for (file_id, base_files) in file_id_to_base_files {
             let mut fg = FileGroup::new(file_id.clone(), partition_path.clone());
@@ -292,6 +290,13 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 fg.add_log_files(log_files)?;
             }
 
+            file_groups.push(fg);
+        }
+
+        // Remaining file ids have log files but no base file: build log-only file groups.
+        for (file_id, log_files) in file_id_to_log_files {
+            let mut fg = FileGroup::new(file_id.clone(), partition_path.clone());
+            fg.add_log_files(log_files)?;
             file_groups.push(fg);
         }
 
@@ -557,7 +562,7 @@ mod tests {
             assert_eq!(file_group.file_slices.len(), 1);
             let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
             assert_eq!(
-                file_slice.base_file.file_name(),
+                file_slice.base_file.as_ref().unwrap().file_name(),
                 "file-id-0_0-7-24_20240418173200000.parquet"
             );
             assert_eq!(file_slice.log_files.len(), 2);
@@ -635,7 +640,7 @@ mod tests {
             let file_group = file_groups.iter().next().unwrap();
             let file_slice = file_group.file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -664,7 +669,13 @@ mod tests {
                 .next()
                 .unwrap();
             assert!(file_slice.log_files.is_empty());
-            let m = file_slice.base_file.file_metadata.as_ref().unwrap();
+            let m = file_slice
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert_eq!(m.name, "fid-0_0-7-24_20240418173200000.parquet");
             assert_eq!(m.size, 4096);
             assert_eq!(m.byte_size, 0);
@@ -704,6 +715,8 @@ mod tests {
                 .next()
                 .unwrap()
                 .base_file
+                .as_ref()
+                .unwrap()
                 .file_metadata
                 .as_ref()
                 .unwrap();
@@ -746,7 +759,14 @@ mod tests {
                 .unwrap();
 
             assert_eq!(file_slice.log_files.len(), 1);
-            assert!(file_slice.base_file.file_metadata.is_none());
+            assert!(
+                file_slice
+                    .base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .is_none()
+            );
         }
 
         #[test]
@@ -770,7 +790,7 @@ mod tests {
                 .values()
                 .next()
                 .unwrap();
-            assert!(fs.base_file.file_metadata.is_none());
+            assert!(fs.base_file.as_ref().unwrap().file_metadata.is_none());
         }
     }
 
@@ -1183,7 +1203,7 @@ mod tests {
             // Verify completion timestamp was set
             let file_slice = file_groups[0].file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -1334,7 +1354,7 @@ mod tests {
         }
 
         #[test]
-        fn test_log_files_without_base_file_not_included() {
+        fn test_log_files_without_base_file_form_log_only_group() {
             let mut records = HashMap::new();
             // Only log files, no base file
             let (key, record) = create_files_record(
@@ -1355,8 +1375,14 @@ mod tests {
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
-            // Log-only file groups are not yet supported (see P1 task)
-            assert!(file_groups_map.is_empty());
+            // A log-only file group is created with a single log-only file slice.
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 1);
+            assert_eq!(file_groups[0].file_id, "file-id-0");
+            assert_eq!(file_groups[0].file_slices.len(), 1);
+            let slice = file_groups[0].file_slices.values().next().unwrap();
+            assert!(!slice.has_base_file());
+            assert_eq!(slice.log_files.len(), 2);
         }
 
         #[test]
@@ -1405,7 +1431,7 @@ mod tests {
             let extensions: HashSet<_> = file_groups
                 .iter()
                 .flat_map(|fg| fg.file_slices.values())
-                .map(|slice| slice.base_file.extension.as_str())
+                .map(|slice| slice.base_file.as_ref().unwrap().extension.as_str())
                 .collect();
 
             assert_eq!(extensions, HashSet::from(["lance", "parquet"]));
@@ -1437,7 +1463,13 @@ mod tests {
             let file_groups = file_groups_map.get("partition1").unwrap();
             let fg = &file_groups[0];
             let (_, file_slice) = fg.file_slices.iter().next().unwrap();
-            let metadata = file_slice.base_file.file_metadata.as_ref().unwrap();
+            let metadata = file_slice
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert_eq!(metadata.size, 5000); // on-disk size
             assert_eq!(metadata.byte_size, 10000); // 5000 * 2.0
             assert_eq!(metadata.num_records, 20); // 5000 / 250

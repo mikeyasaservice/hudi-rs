@@ -406,7 +406,11 @@ impl HudiScanExec {
 
         for slices in partitions {
             for file_slice in slices {
-                if let Some(meta) = &file_slice.base_file.file_metadata {
+                if let Some(meta) = file_slice
+                    .base_file
+                    .as_ref()
+                    .and_then(|bf| bf.file_metadata.as_ref())
+                {
                     if meta.num_records > 0 {
                         total_rows = total_rows.saturating_add(meta.num_records as u64);
                         have_row_estimate = true;
@@ -496,7 +500,7 @@ mod tests {
             num_records,
         });
         FileSlice {
-            base_file: bf,
+            base_file: Some(bf),
             log_files: BTreeSet::new(),
             partition_path: String::new(),
             base_file_column_stats: None,
@@ -533,7 +537,7 @@ mod tests {
         let mut bf = BaseFile::from_str("fileA-0_0-1-1_20250101000000000.parquet").unwrap();
         bf.file_metadata = None;
         let slices = [vec![FileSlice {
-            base_file: bf,
+            base_file: Some(bf),
             log_files: BTreeSet::new(),
             partition_path: String::new(),
             base_file_column_stats: None,
