@@ -144,15 +144,17 @@ generators. These deliver the largest query-side wins, build on infrastructure a
 codebase (HFile reader, MDT record-type enums, file pruner), and keep the project's read-first
 focus.
 
-**Status: implemented.** All Tier 1 items have landed. Two carry scoped boundaries:
+**Status: implemented.**
 
-- **CDC reads**: the self-contained `cdc_data_before_after` supplemental-logging mode (Parquet CDC
-  files) is implemented via `Table::read_cdc`; modes that require reconstructing before/after
-  images from base/log files, and log-based CDC files, return an `Unsupported` error. End-to-end
-  change-stream behavior is not validated by a fixture (the repo has none and hudi-rs is
-  read-only), so the storage-agnostic logic is unit-tested instead.
-- **Schema evolution**: add/drop/reorder/numeric-type-promotion by column name are reconciled in
-  the merge path; column renames (needing Hudi internal-schema column IDs) are not yet handled.
+- **CDC reads**: all supplemental logging modes are supported for both Parquet and log-based (MOR)
+  CDC files. `cdc_data_before_after` reads the self-contained change records directly;
+  `cdc_op_key` and `cdc_data_before` reconstruct the before/after images from the merged snapshots
+  at the change commit and its predecessor. End-to-end change-stream behavior is not validated by a
+  fixture (the repo has none and hudi-rs is read-only), so the logic is unit-tested instead.
+- **Schema evolution**: add/drop/reorder/numeric-type-promotion are reconciled within a MOR slice's
+  merge and across file slices; column renames are tracked by Parquet field id
+  (`PARQUET:field_id`), which Hudi's schema-on-read tables write. Reconciliation is unit-tested;
+  end-to-end validation is likewise fixture-limited.
 
 ### Tier 2 — read-side, medium value or larger effort
 
