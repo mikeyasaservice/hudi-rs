@@ -22,9 +22,11 @@ use crate::error::CoreError;
 use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
 use arrow::array::StringArray;
-use arrow_array::{Array, UInt32Array};
+use arrow::compute::cast;
+use arrow_array::{Array, UInt32Array, new_null_array};
 use arrow_row::{RowConverter, SortField};
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use std::collections::HashMap;
 
 pub trait ColumnAsArray {
     fn get_array(&self, column_name: &str) -> Result<ArrayRef>;
@@ -124,12 +126,237 @@ pub fn project_batch_by_names(
     batch.project(&indices).map_err(CoreError::ArrowError)
 }
 
+fn is_integer_type(d: &DataType) -> bool {
+    matches!(
+        d,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+fn is_float_type(d: &DataType) -> bool {
+    matches!(d, DataType::Float16 | DataType::Float32 | DataType::Float64)
+}
+
+/// Choose a common type for a column that appears with two different types across schemas.
+///
+/// Numeric occurrences are widened (to `Int64` when both are integers, `Float64` when any is
+/// floating). For any other mismatch the newer type (`b`) is chosen; an incompatible change
+/// then surfaces as a cast error in [`adapt_batch_to_schema`] rather than silently mis-reading.
+fn widen_types(a: &DataType, b: &DataType) -> DataType {
+    if a == b {
+        return a.clone();
+    }
+    let a_num = is_integer_type(a) || is_float_type(a);
+    let b_num = is_integer_type(b) || is_float_type(b);
+    if a_num && b_num {
+        if is_float_type(a) || is_float_type(b) {
+            DataType::Float64
+        } else {
+            DataType::Int64
+        }
+    } else {
+        b.clone()
+    }
+}
+
+/// Reconcile a set of (possibly schema-evolved) Arrow schemas into a single target schema for
+/// schema-on-read by column name.
+///
+/// Fields are unioned in first-appearance order. A field's type is widened across the schemas it
+/// appears in (see [`widen_types`]). A field is nullable if it is absent from any input schema or
+/// marked nullable in any of them, so missing columns can be null-filled. When every input schema
+/// is identical the first schema is returned unchanged, keeping the common no-evolution path a
+/// no-op (preserving field order and nullability exactly).
+pub fn reconcile_schemas(schemas: &[SchemaRef]) -> SchemaRef {
+    let Some(first) = schemas.first() else {
+        return SchemaRef::from(Schema::empty());
+    };
+    if schemas.iter().all(|s| s.fields() == first.fields()) {
+        return first.clone();
+    }
+
+    struct Acc {
+        data_type: DataType,
+        present: usize,
+        nullable: bool,
+    }
+
+    let total = schemas.len();
+    let mut order: Vec<String> = Vec::new();
+    let mut acc: HashMap<String, Acc> = HashMap::new();
+    for schema in schemas {
+        for field in schema.fields() {
+            let name = field.name();
+            if let Some(existing) = acc.get_mut(name) {
+                existing.data_type = widen_types(&existing.data_type, field.data_type());
+                existing.present += 1;
+                existing.nullable = existing.nullable || field.is_nullable();
+            } else {
+                order.push(name.clone());
+                acc.insert(
+                    name.clone(),
+                    Acc {
+                        data_type: field.data_type().clone(),
+                        present: 1,
+                        nullable: field.is_nullable(),
+                    },
+                );
+            }
+        }
+    }
+
+    let fields: Vec<Field> = order
+        .iter()
+        .filter_map(|name| {
+            acc.get(name).map(|a| {
+                let nullable = a.nullable || a.present < total;
+                Field::new(name, a.data_type.clone(), nullable)
+            })
+        })
+        .collect();
+    SchemaRef::from(Schema::new(fields))
+}
+
+/// Adapt a [`RecordBatch`] to `target` for schema-on-read: select the target's columns by name
+/// (reordering as needed), cast columns whose type differs, and fill columns missing from the
+/// batch with nulls. Columns of `batch` absent from `target` are dropped. Returns the batch
+/// unchanged when its schema already matches `target`.
+pub fn adapt_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
+    if batch.schema().fields() == target.fields() {
+        return Ok(batch.clone());
+    }
+    let num_rows = batch.num_rows();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
+    for field in target.fields() {
+        match batch.schema().index_of(field.name()) {
+            Ok(idx) => {
+                let col = batch.column(idx);
+                if col.data_type() == field.data_type() {
+                    columns.push(col.clone());
+                } else {
+                    columns.push(cast(col, field.data_type()).map_err(CoreError::ArrowError)?);
+                }
+            }
+            Err(_) => columns.push(new_null_array(field.data_type(), num_rows)),
+        }
+    }
+    RecordBatch::try_new(target.clone(), columns).map_err(CoreError::ArrowError)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow_array::Float64Array;
     use std::sync::Arc;
+
+    fn schema(fields: &[(&str, DataType, bool)]) -> SchemaRef {
+        SchemaRef::from(Schema::new(
+            fields
+                .iter()
+                .map(|(n, t, nullable)| Field::new(*n, t.clone(), *nullable))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn test_reconcile_schemas_identical_is_noop() {
+        let s = schema(&[
+            ("id", DataType::Int32, false),
+            ("name", DataType::Utf8, true),
+        ]);
+        let out = reconcile_schemas(&[s.clone(), s.clone()]);
+        // Same instance preserved (order + nullability unchanged).
+        assert_eq!(out.fields(), s.fields());
+        assert!(!out.field(0).is_nullable());
+    }
+
+    #[test]
+    fn test_reconcile_schemas_added_column_is_nullable_and_appended() {
+        let base = schema(&[("id", DataType::Int32, false)]);
+        let evolved = schema(&[
+            ("id", DataType::Int32, false),
+            ("city", DataType::Utf8, false),
+        ]);
+        let out = reconcile_schemas(&[base, evolved]);
+        assert_eq!(out.fields().len(), 2);
+        assert_eq!(out.field(1).name(), "city");
+        // `city` is absent from the base schema, so it must be nullable in the target.
+        assert!(out.field(1).is_nullable());
+        // `id` present in both and non-nullable stays non-nullable.
+        assert!(!out.field(0).is_nullable());
+    }
+
+    #[test]
+    fn test_reconcile_schemas_widens_numeric_types() {
+        let s32 = schema(&[("v", DataType::Int32, false)]);
+        let s64 = schema(&[("v", DataType::Int64, false)]);
+        let out = reconcile_schemas(&[s32, s64]);
+        assert_eq!(out.field(0).data_type(), &DataType::Int64);
+
+        let sf = schema(&[("v", DataType::Float64, false)]);
+        let si = schema(&[("v", DataType::Int32, false)]);
+        let out = reconcile_schemas(&[si, sf]);
+        assert_eq!(out.field(0).data_type(), &DataType::Float64);
+    }
+
+    #[test]
+    fn test_adapt_batch_fills_missing_casts_and_reorders() {
+        // Batch has [v: Int32, id: Int32]; target wants [id: Int64, v: Int64, city: Utf8].
+        let batch = RecordBatch::try_new(
+            schema(&[
+                ("v", DataType::Int32, false),
+                ("id", DataType::Int32, false),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let target = schema(&[
+            ("id", DataType::Int64, false),
+            ("v", DataType::Int64, false),
+            ("city", DataType::Utf8, true),
+        ]);
+
+        let adapted = adapt_batch_to_schema(&batch, &target).unwrap();
+        assert_eq!(adapted.schema().fields(), target.fields());
+
+        let ids = adapted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 2]);
+        let vs = adapted
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(vs.values(), &[10, 20]);
+        // Missing column filled with nulls.
+        assert_eq!(adapted.column(2).null_count(), 2);
+    }
+
+    #[test]
+    fn test_adapt_batch_identical_schema_is_noop() {
+        let s = schema(&[("id", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            s.clone(),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+        let adapted = adapt_batch_to_schema(&batch, &s).unwrap();
+        assert_eq!(adapted.schema().fields(), s.fields());
+    }
 
     #[test]
     fn test_basic_int_sort() {

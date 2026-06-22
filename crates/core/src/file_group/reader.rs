@@ -41,10 +41,11 @@ use crate::storage::error::StorageError;
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
-use crate::util::arrow::project_batch_by_names;
+use crate::util::arrow::{adapt_batch_to_schema, project_batch_by_names, reconcile_schemas};
 use arrow::compute::and;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::SchemaRef;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryFutureExt};
 use std::collections::HashMap;
@@ -249,13 +250,32 @@ impl FileGroupReader {
             }
         };
 
-        let Some(schema) = log_batches.data_batches.first().map(|b| b.schema()) else {
+        if log_batches.data_batches.is_empty() {
             return Err(ReadFileSliceError(
                 "Log-only file slice produced no data records to derive a schema".to_string(),
             ));
-        };
-        let merger = RecordMerger::new(schema, self.hudi_configs.clone());
-        let merged = merger.merge_record_batches(log_batches)?;
+        }
+
+        // Reconcile across the log data blocks in case columns evolved between deltacommits.
+        let schemas: Vec<SchemaRef> = log_batches
+            .data_batches
+            .iter()
+            .map(|b| b.schema())
+            .collect();
+        let target = reconcile_schemas(&schemas);
+        let mut adapted = RecordBatches::new_with_capacity(
+            log_batches.num_data_batches(),
+            log_batches.num_delete_batches(),
+        );
+        for data_batch in &log_batches.data_batches {
+            adapted.push_data_batch(adapt_batch_to_schema(data_batch, &target)?);
+        }
+        for (delete_batch, instant_time) in &log_batches.delete_batches {
+            adapted.push_delete_batch(delete_batch.clone(), instant_time.clone());
+        }
+
+        let merger = RecordMerger::new(target, self.hudi_configs.clone());
+        let merged = merger.merge_record_batches(adapted)?;
         apply_eager_options(&options, merged)
     }
 
@@ -301,15 +321,28 @@ impl FileGroupReader {
             };
 
             let base_batch = self.read_base_file_eager(base_file_path).await?;
-            let schema = base_batch.schema();
-            let num_data_batches = log_batches.num_data_batches() + 1;
-            let num_delete_batches = log_batches.num_delete_batches();
-            let mut all_batches =
-                RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
-            all_batches.push_data_batch(base_batch);
-            all_batches.extend(log_batches);
 
-            let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
+            // Reconcile base and log schemas so columns added, reordered, or numerically
+            // promoted across commits line up before merging (schema-on-read by column name).
+            let mut schemas: Vec<SchemaRef> =
+                Vec::with_capacity(log_batches.num_data_batches() + 1);
+            schemas.push(base_batch.schema());
+            schemas.extend(log_batches.data_batches.iter().map(|b| b.schema()));
+            let target = reconcile_schemas(&schemas);
+
+            let mut all_batches = RecordBatches::new_with_capacity(
+                log_batches.num_data_batches() + 1,
+                log_batches.num_delete_batches(),
+            );
+            all_batches.push_data_batch(adapt_batch_to_schema(&base_batch, &target)?);
+            for data_batch in &log_batches.data_batches {
+                all_batches.push_data_batch(adapt_batch_to_schema(data_batch, &target)?);
+            }
+            for (delete_batch, instant_time) in &log_batches.delete_batches {
+                all_batches.push_delete_batch(delete_batch.clone(), instant_time.clone());
+            }
+
+            let merger = RecordMerger::new(target, self.hudi_configs.clone());
             merger.merge_record_batches(all_batches)?
         };
 
