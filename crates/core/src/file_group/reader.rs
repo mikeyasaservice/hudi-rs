@@ -41,10 +41,11 @@ use crate::storage::error::StorageError;
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
-use crate::util::arrow::project_batch_by_names;
+use crate::util::arrow::{adapt_batch_to_schema, project_batch_by_names, reconcile_schemas};
 use arrow::compute::and;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::{Schema, SchemaRef};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryFutureExt};
 use std::collections::HashMap;
@@ -207,7 +208,6 @@ impl FileGroupReader {
         file_slice: &FileSlice,
         options: &ReadOptions,
     ) -> Result<RecordBatch> {
-        let base_file_path = file_slice.base_file_relative_path()?;
         let log_file_paths = if file_slice.has_log_file() {
             file_slice
                 .log_files
@@ -217,8 +217,128 @@ impl FileGroupReader {
         } else {
             vec![]
         };
+        if !file_slice.has_base_file() {
+            return self.read_log_only(log_file_paths, options).await;
+        }
+        let base_file_path = file_slice.base_file_relative_path()?;
         self.read_file_slice_from_paths(&base_file_path, log_file_paths, options)
             .await
+    }
+
+    /// Drop columns that `hoodie.datasource.write.drop.partition.columns` removed from data files.
+    ///
+    /// Schema reconciliation unions base and log schemas, but a log block may still carry a
+    /// partition column that was dropped from the base file. Resurfacing it would make a dropped
+    /// partition column readable, so it is excluded from the merge target when the config is set.
+    fn exclude_dropped_partition_columns(&self, schema: SchemaRef) -> SchemaRef {
+        let drops: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
+            .into();
+        if !drops {
+            return schema;
+        }
+        let dropped = crate::keygen::partition_column_names(&self.hudi_configs);
+        if dropped.is_empty() {
+            return schema;
+        }
+        let fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .filter(|f| !dropped.iter().any(|d| d == f.name()))
+            .cloned()
+            .collect();
+        if fields.len() == schema.fields().len() {
+            return schema;
+        }
+        SchemaRef::from(Schema::new(fields))
+    }
+
+    /// Read a log-only file slice (no base file): scan and merge the log files alone.
+    ///
+    /// The merge schema is taken from the first log data block. Returns an error if the
+    /// scan yields no data records (e.g. delete-only or fully filtered), since there is no
+    /// base file to supply the schema.
+    async fn read_log_only(
+        &self,
+        log_file_paths: Vec<String>,
+        options: &ReadOptions,
+    ) -> Result<RecordBatch> {
+        let options = self.resolve_read_options(options)?;
+        let instant_range = self.create_instant_range_for_log_file_scan()?;
+        let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            .scan(log_file_paths, &instant_range)
+            .await?;
+        let log_batches = match scan_result {
+            ScanResult::RecordBatches(batches) => batches,
+            ScanResult::Empty => RecordBatches::new(),
+            ScanResult::HFileRecords(_) => {
+                return Err(CoreError::LogBlockError(
+                    "Unexpected HFile records in regular table log file".to_string(),
+                ));
+            }
+        };
+
+        if log_batches.data_batches.is_empty() {
+            return Err(ReadFileSliceError(
+                "Log-only file slice produced no data records to derive a schema".to_string(),
+            ));
+        }
+
+        // Reconcile across the log data blocks in case columns evolved between deltacommits.
+        let schemas: Vec<SchemaRef> = log_batches
+            .data_batches
+            .iter()
+            .map(|b| b.schema())
+            .collect();
+        let target = self.exclude_dropped_partition_columns(reconcile_schemas(&schemas));
+        let mut adapted = RecordBatches::new_with_capacity(
+            log_batches.num_data_batches(),
+            log_batches.num_delete_batches(),
+        );
+        for data_batch in &log_batches.data_batches {
+            adapted.push_data_batch(adapt_batch_to_schema(data_batch, &target)?);
+        }
+        for (delete_batch, instant_time) in &log_batches.delete_batches {
+            adapted.push_delete_batch(delete_batch.clone(), instant_time.clone());
+        }
+
+        let merger = RecordMerger::new(target, self.hudi_configs.clone());
+        let merged = merger.merge_record_batches(adapted)?;
+        apply_eager_options(&options, merged)
+    }
+
+    /// Read a log-based CDC file: scan its CDC data log blocks and return the change records.
+    ///
+    /// Unlike the data read path, change records are returned as-is (no record merge): each block
+    /// is a list of CDC change records. Blocks are reconciled to a common schema and concatenated.
+    pub async fn read_cdc_log_file(&self, relative_path: &str) -> Result<RecordBatch> {
+        let instant_range = self.create_instant_range_for_log_file_scan()?;
+        let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            .scan(vec![relative_path.to_string()], &instant_range)
+            .await?;
+        let batches = match scan_result {
+            ScanResult::RecordBatches(b) => b,
+            ScanResult::Empty => {
+                return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
+            }
+            ScanResult::HFileRecords(_) => {
+                return Err(CoreError::LogBlockError(
+                    "Unexpected HFile records in CDC log file".to_string(),
+                ));
+            }
+        };
+        if batches.data_batches.is_empty() {
+            return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
+        }
+        let schemas: Vec<SchemaRef> = batches.data_batches.iter().map(|b| b.schema()).collect();
+        let target = reconcile_schemas(&schemas);
+        let adapted: Vec<RecordBatch> = batches
+            .data_batches
+            .iter()
+            .map(|b| adapt_batch_to_schema(b, &target))
+            .collect::<Result<_>>()?;
+        arrow_select::concat::concat_batches(&target, &adapted).map_err(CoreError::ArrowError)
     }
 
     /// Reads a file slice from a base file and a list of log files.
@@ -263,15 +383,28 @@ impl FileGroupReader {
             };
 
             let base_batch = self.read_base_file_eager(base_file_path).await?;
-            let schema = base_batch.schema();
-            let num_data_batches = log_batches.num_data_batches() + 1;
-            let num_delete_batches = log_batches.num_delete_batches();
-            let mut all_batches =
-                RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
-            all_batches.push_data_batch(base_batch);
-            all_batches.extend(log_batches);
 
-            let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
+            // Reconcile base and log schemas so columns added, reordered, or numerically
+            // promoted across commits line up before merging (schema-on-read by column name).
+            let mut schemas: Vec<SchemaRef> =
+                Vec::with_capacity(log_batches.num_data_batches() + 1);
+            schemas.push(base_batch.schema());
+            schemas.extend(log_batches.data_batches.iter().map(|b| b.schema()));
+            let target = self.exclude_dropped_partition_columns(reconcile_schemas(&schemas));
+
+            let mut all_batches = RecordBatches::new_with_capacity(
+                log_batches.num_data_batches() + 1,
+                log_batches.num_delete_batches(),
+            );
+            all_batches.push_data_batch(adapt_batch_to_schema(&base_batch, &target)?);
+            for data_batch in &log_batches.data_batches {
+                all_batches.push_data_batch(adapt_batch_to_schema(data_batch, &target)?);
+            }
+            for (delete_batch, instant_time) in &log_batches.delete_batches {
+                all_batches.push_delete_batch(delete_batch.clone(), instant_time.clone());
+            }
+
+            let merger = RecordMerger::new(target, self.hudi_configs.clone());
             merger.merge_record_batches(all_batches)?
         };
 
@@ -319,12 +452,6 @@ impl FileGroupReader {
         file_slice: &FileSlice,
         options: &ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let base_file_path = file_slice.base_file_relative_path()?;
-        let known_base_file_size = file_slice
-            .base_file
-            .file_metadata
-            .as_ref()
-            .map(|metadata| metadata.size);
         let log_file_paths: Vec<String> = if file_slice.has_log_file() {
             file_slice
                 .log_files
@@ -334,6 +461,20 @@ impl FileGroupReader {
         } else {
             vec![]
         };
+
+        // Log-only slices have no base file to stream; collect-and-merge the logs and yield
+        // the result as a single batch (same fallback used for MOR slices with log files).
+        if !file_slice.has_base_file() {
+            let batch = self.read_log_only(log_file_paths, options).await?;
+            return Ok(Box::pin(futures::stream::once(async move { Ok(batch) })));
+        }
+
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let known_base_file_size = file_slice
+            .base_file
+            .as_ref()
+            .and_then(|bf| bf.file_metadata.as_ref())
+            .map(|metadata| metadata.size);
 
         self.read_file_slice_from_paths_stream_inner(
             &base_file_path,
@@ -445,9 +586,8 @@ impl FileGroupReader {
             .get_or_default(HudiTableConfig::DropsPartitionFields)
             .into();
         let dropped_partition_columns: Vec<String> = if drops_partition_columns {
-            self.hudi_configs
-                .get_or_default(HudiTableConfig::PartitionFields)
-                .into()
+            // Strip any CustomKeyGenerator `field:TYPE` suffixes so the names match data columns.
+            crate::keygen::partition_column_names(&self.hudi_configs)
         } else {
             Vec::new()
         };
@@ -743,6 +883,7 @@ mod tests {
     use crate::error::CoreError;
     use crate::file_group::base_file::BaseFile;
     use crate::file_group::file_slice::FileSlice;
+    use crate::file_group::log_file::LogFile;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -962,6 +1103,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_log_only_file_slice_with_real_log_files() -> Result<()> {
+        use futures::StreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        // Read a log-only file slice (no base file) built from real chennai delta log files.
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let base_url = Url::from_directory_path(&table_path).unwrap();
+        let reader = FileGroupReader::new_with_options(base_url.as_str(), empty_options()).await?;
+
+        let mut file_slice = FileSlice::new_log_only("city=chennai".to_string());
+        for name in [
+            ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210127080.log.1_0-1072-3078",
+            ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210128625.log.1_0-1097-3150",
+        ] {
+            file_slice.log_files.insert(LogFile::from_str(name)?);
+        }
+        assert!(!file_slice.has_base_file());
+        assert_eq!(
+            file_slice.file_id(),
+            "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0"
+        );
+
+        // The log-only read path scans and merges the logs with no base file, producing a
+        // batch with the table's data schema (derived from the log data blocks).
+        let batch = reader
+            .read_file_slice(&file_slice, &ReadOptions::new())
+            .await?;
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            field_names.contains(&"uuid") && field_names.contains(&"rider"),
+            "log-only read should expose the table's columns, got {field_names:?}"
+        );
+
+        // Streaming a log-only slice falls back to a single merged batch with the same rows.
+        let mut stream = reader
+            .read_file_slice_stream(&file_slice, &ReadOptions::new())
+            .await?;
+        let mut streamed_rows = 0usize;
+        while let Some(b) = stream.next().await {
+            streamed_rows += b?.num_rows();
+        }
+        assert_eq!(streamed_rows, batch.num_rows());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_read_file_slice_from_paths_read_optimized_ignores_log_files() -> Result<()> {
         // In read-optimized mode the log file paths must be ignored. We pass a
         // bogus log path; the call would error if it were not skipped.
@@ -1167,7 +1355,7 @@ mod tests {
 
         // Sanity-check: same call without populated metadata reads the same rows.
         let mut bare_slice = file_slice.clone();
-        bare_slice.base_file.file_metadata = None;
+        bare_slice.base_file.as_mut().unwrap().file_metadata = None;
         let bare_total: usize = {
             let mut s = reader.read_file_slice_stream(&bare_slice, &options).await?;
             let mut sum = 0;

@@ -47,6 +47,7 @@
 //! ```
 
 mod avro_to_arrow;
+pub mod cdc;
 pub mod config;
 pub mod error;
 pub mod expr;

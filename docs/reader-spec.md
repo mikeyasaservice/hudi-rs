@@ -40,7 +40,7 @@ The two `QueryType` variants on `ReadOptions`:
 - **Snapshot** — latest table state at one commit (the latest by default; an explicit `as_of_timestamp` for time-travel).
 - **Incremental** — records changed in the half-open range (`start_timestamp`, `end_timestamp`].
 
-Snapshot reads have an **eager** form returning all batches and a **streaming** form yielding batches as they're read. Incremental reads currently expose only the eager form.
+Both snapshot and incremental reads have an **eager** form returning all batches and a **streaming** form yielding batches as they're read.
 
 Per-slice reads — reading a single `FileSlice` the caller already selected (typically obtained from `get_file_slices` with the right options) — are not a query type; they live on `FileGroupReader` and have both eager and streaming forms.
 
@@ -76,7 +76,7 @@ Which knobs each API consumes:
 
 Notes:
 
-- `read_stream` errors with `Unsupported` for `query_type = Incremental` — incremental streaming is not yet implemented.
+- `read_stream` streams `query_type = Incremental` as the `(start, end]` change records, applying the same commit-time mask as the eager incremental read.
 - The `hudi_options` bag is a per-read override layer — set arbitrary `hoodie.read.*` configs (e.g. `hoodie.read.use.read_optimized.mode = true`) for this single read. Read configs (`hoodie.read.*`) are not stored in the `Table` instance; they flow exclusively through `ReadOptions`.
 - Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods. The method resolves timestamps automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same `ReadOptions` used for `get_file_slices`.
 - For parallel reads, call `get_file_slices(...)` and bucket the result with `hudi::util::collection::split_into_chunks` or your engine's preferred partitioning policy.
@@ -125,7 +125,7 @@ All public symbols are re-exported from the `hudi` crate.
 | `get_file_slices(&ReadOptions)`                                            | `Result<Vec<FileSlice>>` (dispatches on `query_type`) |
 | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | `Result<FileGroupReader>`                            |
 | `read(&ReadOptions)`                                                       | `Result<Vec<RecordBatch>>` (dispatches on `query_type`) |
-| `read_stream(&ReadOptions)`                                                | `Result<BoxStream<'static, Result<RecordBatch>>>` (errors on `Incremental`) |
+| `read_stream(&ReadOptions)`                                                | `Result<BoxStream<'static, Result<RecordBatch>>>` (snapshot or incremental) |
 | `compute_table_stats(Option<&ReadOptions>)`                                | `Option<(u64, u64)>` — `(rows, byte_size)`; see §7   |
 
 ### `FileGroupReader`
@@ -227,7 +227,7 @@ table = (
 | `get_file_slices(options=None)`                                                                    | `List[HudiFileSlice]` (dispatches on `options.query_type`) |
 | `create_file_group_reader_with_options(read_options=None, extra_storage_overrides=None)` | `HudiFileGroupReader`                    |
 | `read(options=None)`                                                                               | `List[pyarrow.RecordBatch]` (dispatches on `query_type`) |
-| `read_stream(options=None)`                                                                        | `HudiRecordBatchStream` (errors on `Incremental`) |
+| `read_stream(options=None)`                                                                        | `HudiRecordBatchStream` (snapshot or incremental) |
 | `compute_table_stats(options=None)`                                                                | `Optional[Tuple[int, int]]`; see §7      |
 
 ### `HudiFileGroupReader`

@@ -26,10 +26,13 @@ use std::fmt::Display;
 use std::path::PathBuf;
 
 /// Within a [crate::file_group::FileGroup],
-/// a [FileSlice] is a logical group of [BaseFile] and [LogFile]s.
+/// a [FileSlice] is a logical group of an optional [BaseFile] and a set of [LogFile]s.
+///
+/// `base_file` is `None` for log-only file slices — MOR file groups whose records live
+/// solely in log files because no base file has been written (or compacted) yet.
 #[derive(Clone, Debug)]
 pub struct FileSlice {
-    pub base_file: BaseFile,
+    pub base_file: Option<BaseFile>,
     pub log_files: BTreeSet<LogFile>,
     pub partition_path: String,
     /// Column statistics from the base file's Parquet footer.
@@ -41,11 +44,20 @@ pub struct FileSlice {
 
 impl Display for FileSlice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "FileSlice {{ base_file: {}, log_files: {:?}, partition_path: {} }}",
-            self.base_file, self.log_files, self.partition_path
-        )
+        match &self.base_file {
+            Some(base_file) => write!(
+                f,
+                "FileSlice {{ base_file: {}, log_files: {:?}, partition_path: {} }}",
+                base_file, self.log_files, self.partition_path
+            ),
+            None => write!(
+                f,
+                "FileSlice {{ base_file: <none>, file_id: {}, log_files: {:?}, partition_path: {} }}",
+                self.file_id(),
+                self.log_files,
+                self.partition_path
+            ),
+        }
     }
 }
 
@@ -60,11 +72,27 @@ impl Eq for FileSlice {}
 impl FileSlice {
     pub fn new(base_file: BaseFile, partition_path: String) -> Self {
         Self {
-            base_file,
+            base_file: Some(base_file),
             log_files: BTreeSet::new(),
             partition_path,
             base_file_column_stats: None,
         }
+    }
+
+    /// Create a log-only [FileSlice] (no base file). Callers add the log files afterwards.
+    pub fn new_log_only(partition_path: String) -> Self {
+        Self {
+            base_file: None,
+            log_files: BTreeSet::new(),
+            partition_path,
+            base_file_column_stats: None,
+        }
+    }
+
+    /// Returns `true` if this file slice has a base file (i.e. it is not log-only).
+    #[inline]
+    pub fn has_base_file(&self) -> bool {
+        self.base_file.is_some()
     }
 
     #[inline]
@@ -90,10 +118,16 @@ impl FileSlice {
         })
     }
 
-    /// Returns the relative path of the [BaseFile] in the [FileSlice].
+    /// Returns the relative path of the [BaseFile] in the [FileSlice], or an error for a
+    /// log-only slice that has no base file.
     pub fn base_file_relative_path(&self) -> Result<String> {
-        let file_name = &self.base_file.file_name();
-        self.relative_path_for_file(file_name)
+        let base_file = self.base_file.as_ref().ok_or_else(|| {
+            CoreError::FileGroup(format!(
+                "File slice {} has no base file (log-only)",
+                self.file_id()
+            ))
+        })?;
+        self.relative_path_for_file(&base_file.file_name())
     }
 
     /// Returns the relative path of the given [LogFile] in the [FileSlice].
@@ -103,17 +137,35 @@ impl FileSlice {
     }
 
     /// Returns the enclosing [FileGroup]'s id.
+    ///
+    /// Derived from the base file when present, otherwise from a log file; both carry the
+    /// same file id. Returns `""` only for an empty slice with neither, which should not occur.
     #[inline]
     pub fn file_id(&self) -> &str {
-        &self.base_file.file_id
+        if let Some(base_file) = &self.base_file {
+            return &base_file.file_id;
+        }
+        self.log_files
+            .iter()
+            .next()
+            .map(|lf| lf.file_id.as_str())
+            .unwrap_or("")
     }
 
     /// Returns the instant time that marks the [FileSlice] creation.
     ///
-    /// This is also an instant time stored in the [Timeline].
+    /// This is also an instant time stored in the [Timeline]. For a log-only slice it is the
+    /// earliest log file's instant time.
     #[inline]
     pub fn creation_instant_time(&self) -> &str {
-        &self.base_file.commit_timestamp
+        if let Some(base_file) = &self.base_file {
+            return &base_file.commit_timestamp;
+        }
+        self.log_files
+            .iter()
+            .next()
+            .map(|lf| lf.timestamp.as_str())
+            .unwrap_or("")
     }
 
     /// Total on-disk size of the file slice (base file + all log files), in bytes.
@@ -128,8 +180,8 @@ impl FileSlice {
     pub fn total_size_bytes(&self) -> u64 {
         let base = self
             .base_file
-            .file_metadata
             .as_ref()
+            .and_then(|bf| bf.file_metadata.as_ref())
             .map(|m| m.size)
             .unwrap_or(0);
         let logs: u64 = self
@@ -173,14 +225,14 @@ mod tests {
         )?);
 
         let mut slice1 = FileSlice {
-            base_file: base.clone(),
+            base_file: Some(base.clone()),
             log_files: log_set1,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,
         };
 
         let slice2 = FileSlice {
-            base_file: base,
+            base_file: Some(base),
             log_files: log_set2,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,
@@ -211,18 +263,18 @@ mod tests {
     #[test]
     fn test_merge_different_base_files() -> Result<()> {
         let mut slice1 = FileSlice {
-            base_file: BaseFile::from_str(
+            base_file: Some(BaseFile::from_str(
                 "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
-            )?,
+            )?),
             log_files: BTreeSet::new(),
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,
         };
 
         let slice2 = FileSlice {
-            base_file: BaseFile::from_str(
+            base_file: Some(BaseFile::from_str(
                 "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
-            )?,
+            )?),
             log_files: BTreeSet::new(),
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,
@@ -240,14 +292,14 @@ mod tests {
             "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
         )?;
         let mut slice1 = FileSlice {
-            base_file: base.clone(),
+            base_file: Some(base.clone()),
             log_files: BTreeSet::new(),
             partition_path: "path/to/partition1".to_string(),
             base_file_column_stats: None,
         };
 
         let slice2 = FileSlice {
-            base_file: base,
+            base_file: Some(base),
             log_files: BTreeSet::new(),
             partition_path: "path/to/partition2".to_string(),
             base_file_column_stats: None,
@@ -280,7 +332,7 @@ mod tests {
     #[test]
     fn test_total_size_bytes_base_only() {
         let slice = FileSlice {
-            base_file: make_base_file_with_metadata(1000),
+            base_file: Some(make_base_file_with_metadata(1000)),
             log_files: BTreeSet::new(),
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,
@@ -294,7 +346,7 @@ mod tests {
         logs.insert(make_log_file_with_metadata(1, Some(200)));
         logs.insert(make_log_file_with_metadata(2, Some(300)));
         let slice = FileSlice {
-            base_file: make_base_file_with_metadata(1000),
+            base_file: Some(make_base_file_with_metadata(1000)),
             log_files: logs,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,
@@ -308,7 +360,7 @@ mod tests {
         logs.insert(make_log_file_with_metadata(1, Some(200)));
         logs.insert(make_log_file_with_metadata(2, None));
         let slice = FileSlice {
-            base_file: make_base_file_with_metadata(1000),
+            base_file: Some(make_base_file_with_metadata(1000)),
             log_files: logs,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,
@@ -326,7 +378,7 @@ mod tests {
         .unwrap();
         bf.file_metadata = None;
         let slice = FileSlice {
-            base_file: bf,
+            base_file: Some(bf),
             log_files: logs,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
             base_file_column_stats: None,

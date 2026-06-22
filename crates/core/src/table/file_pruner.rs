@@ -121,10 +121,14 @@ impl FilePruner {
     ///
     /// Returns `true` if the file can definitely be pruned (no rows can match).
     fn can_prune_by_filter(&self, filter: &SchemableFilter, col_stats: &ColumnStatistics) -> bool {
-        // Multi-value operators not yet supported for file-level pruning
-        // TODO: support IN/NOT IN by checking if all values are outside the min/max range
-        if filter.operator.is_multi_value() {
-            return false;
+        let min = &col_stats.min_value;
+        let max = &col_stats.max_value;
+
+        // Multi-value operators are evaluated against every value in the list.
+        match filter.operator {
+            ExprOperator::In => return self.can_prune_in(filter, min, max),
+            ExprOperator::NotIn => return self.can_prune_not_in(filter, min, max),
+            _ => {}
         }
 
         // Get the filter value as an ArrayRef
@@ -132,9 +136,6 @@ impl FilePruner {
         let Some(filter_value) = filter_array else {
             return false; // Cannot extract value, don't prune
         };
-
-        let min = &col_stats.min_value;
-        let max = &col_stats.max_value;
 
         match filter.operator {
             ExprOperator::Eq => {
@@ -162,9 +163,81 @@ impl FilePruner {
                 self.can_prune_gte(&filter_value, max)
             }
             ExprOperator::In | ExprOperator::NotIn => {
-                unreachable!("Multi-value operators are short-circuited above")
+                unreachable!("Multi-value operators are handled above")
             }
         }
+    }
+
+    /// Prune for `col IN (v1, v2, ...)`: prune only if every value lies strictly outside
+    /// `[min, max]`, so no listed value can match any row in the file.
+    fn can_prune_in(
+        &self,
+        filter: &SchemableFilter,
+        min: &Option<ArrayRef>,
+        max: &Option<ArrayRef>,
+    ) -> bool {
+        let (Some(min_val), Some(max_val)) = (min, max) else {
+            return false;
+        };
+
+        let values = self.extract_filter_values(filter);
+        // If any value could not be extracted, conservatively keep the file: pruning on a
+        // partial value set could drop a file an unseen in-range value would have matched.
+        if values.is_empty() || values.len() != filter.values.len() {
+            return false;
+        }
+
+        values.iter().all(|value| {
+            let below = cmp::lt(value, min_val).map(|r| r.value(0)).unwrap_or(false);
+            let above = cmp::gt(value, max_val).map(|r| r.value(0)).unwrap_or(false);
+            below || above
+        })
+    }
+
+    /// Prune for `col NOT IN (v1, v2, ...)`: prune only when the file holds a single value
+    /// (`min == max`) that is one of the excluded values, so every row is excluded.
+    fn can_prune_not_in(
+        &self,
+        filter: &SchemableFilter,
+        min: &Option<ArrayRef>,
+        max: &Option<ArrayRef>,
+    ) -> bool {
+        let (Some(min_val), Some(max_val)) = (min, max) else {
+            return false;
+        };
+
+        let min_eq_max = cmp::eq(min_val, max_val)
+            .map(|r| r.value(0))
+            .unwrap_or(false);
+        if !min_eq_max {
+            return false;
+        }
+
+        // A missing value here only forgoes a pruning opportunity, so partial extraction
+        // stays safe (unlike IN).
+        self.extract_filter_values(filter)
+            .iter()
+            .any(|value| cmp::eq(min_val, value).map(|r| r.value(0)).unwrap_or(false))
+    }
+
+    /// Extract each filter value as a single-element [`ArrayRef`], skipping any that are
+    /// not scalar/single-element.
+    fn extract_filter_values(&self, filter: &SchemableFilter) -> Vec<ArrayRef> {
+        filter
+            .values
+            .iter()
+            .filter_map(|v| {
+                let (array, is_scalar) = v.get();
+                if array.is_empty() {
+                    return None;
+                }
+                if is_scalar || array.len() == 1 {
+                    Some(array.slice(0, 1))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Prune for `col = value`: prune if value < min OR value > max
@@ -540,37 +613,53 @@ mod tests {
         assert!(pruner.should_include(&stats2));
     }
 
-    #[test]
-    fn test_in_not_in_operators_no_prune() {
-        let table_schema = create_test_schema();
-        let partition_schema = Schema::empty();
-
-        // IN operator should not prune (conservative approach)
+    fn in_pruner(op: ExprOperator, values: &[&str]) -> FilePruner {
         let filters = vec![
             Filter::new(
                 "id".to_string(),
-                ExprOperator::In,
-                vec!["5".to_string(), "10".to_string()],
+                op,
+                values.iter().map(|s| s.to_string()).collect(),
             )
             .unwrap(),
         ];
-        let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+        FilePruner::new(&filters, &create_test_schema(), &Schema::empty()).unwrap()
+    }
 
-        // Even though 5 and 10 are below min=50, conservative approach includes file
+    #[test]
+    fn test_in_filter_prunes_when_all_values_outside_range() {
+        // id IN (5, 10) with stats min=50, max=100: both values below min -> prune.
+        let pruner = in_pruner(ExprOperator::In, &["5", "10"]);
+        let stats = create_stats_with_int_range("id", 50, 100);
+        assert!(!pruner.should_include(&stats));
+    }
+
+    #[test]
+    fn test_in_filter_includes_when_a_value_is_in_range() {
+        // id IN (5, 75): 75 falls within [50, 100] -> the file may match -> include.
+        let pruner = in_pruner(ExprOperator::In, &["5", "75"]);
+        let stats = create_stats_with_int_range("id", 50, 100);
+        assert!(pruner.should_include(&stats));
+    }
+
+    #[test]
+    fn test_not_in_filter_prunes_when_single_value_is_excluded() {
+        // id NOT IN (50, 60) with stats min=max=50: every row equals an excluded value.
+        let pruner = in_pruner(ExprOperator::NotIn, &["50", "60"]);
+        let stats = create_stats_with_int_range("id", 50, 50);
+        assert!(!pruner.should_include(&stats));
+    }
+
+    #[test]
+    fn test_not_in_filter_includes_when_range_spans_values() {
+        // id NOT IN (5, 10) with stats min=50, max=100: rows can avoid the excluded set.
+        let pruner = in_pruner(ExprOperator::NotIn, &["5", "10"]);
         let stats = create_stats_with_int_range("id", 50, 100);
         assert!(pruner.should_include(&stats));
 
-        // NOT IN operator should also not prune
-        let filters = vec![
-            Filter::new(
-                "id".to_string(),
-                ExprOperator::NotIn,
-                vec!["5".to_string(), "10".to_string()],
-            )
-            .unwrap(),
-        ];
-        let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
-        assert!(pruner.should_include(&stats));
+        // Even when the single file value differs from the excluded values, include it.
+        let pruner = in_pruner(ExprOperator::NotIn, &["5", "10"]);
+        let single = create_stats_with_int_range("id", 50, 50);
+        assert!(pruner.should_include(&single));
     }
 
     #[test]

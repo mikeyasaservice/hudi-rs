@@ -93,14 +93,18 @@ mod listing;
 pub mod partition;
 mod validation;
 
+#[cfg(test)]
+mod fixture;
+#[cfg(test)]
+mod schema_evolution_cdc_tests;
+
 pub use crate::config::read_options::{QueryType, ReadOptions};
 
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
-use crate::error::CoreError;
+use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -108,6 +112,7 @@ use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::meta_field::MetaField;
+use crate::metadata::table::record_index;
 use crate::schema::resolver::{
     resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema, resolve_schema,
 };
@@ -411,8 +416,7 @@ impl Table {
             )]));
         }
 
-        let partition_field_names: Vec<String> =
-            self.hudi_configs.get_or_default(PartitionFields).into();
+        let partition_field_names = crate::keygen::partition_column_names(&self.hudi_configs);
 
         let schema = self.get_schema().await?;
         project_partition_schema(&schema, &partition_field_names)
@@ -521,12 +525,84 @@ impl Table {
             )
             .await?;
 
+        self.prune_file_slices_with_record_index(timestamp, filters, &mut file_slices)
+            .await?;
+
         if base_file_only {
             for fs in &mut file_slices {
                 fs.log_files.clear();
             }
         }
         Ok(file_slices)
+    }
+
+    /// Prune `file_slices` to those that can hold a record matching an equality / `IN`
+    /// predicate on the record key, using the metadata table record-level index.
+    ///
+    /// Only applies to a single-field record key, when the metadata table has a
+    /// `record_index` partition and the query targets the latest commit (the index
+    /// reflects the latest state). When at least one key resolves, slices not matching any
+    /// resolved `(partition, file_id)` location are dropped; if no key resolves, slices are
+    /// left untouched and the row-level mask still applies — so this never drops a file a
+    /// matching row could live in.
+    async fn prune_file_slices_with_record_index(
+        &self,
+        timestamp: &str,
+        filters: &[Filter],
+        file_slices: &mut Vec<FileSlice>,
+    ) -> Result<()> {
+        let Some(record_keys) = self.record_index_keys_from_filters(filters) else {
+            return Ok(());
+        };
+        // The record index reflects the latest state, so only use it at the latest commit.
+        if self.timeline.get_latest_commit_timestamp_as_option() != Some(timestamp) {
+            return Ok(());
+        }
+        if !self
+            .get_metadata_table_partitions()
+            .iter()
+            .any(|p| p == record_index::RECORD_INDEX_PARTITION_NAME)
+        {
+            return Ok(());
+        }
+
+        let key_refs: Vec<&str> = record_keys.iter().map(String::as_str).collect();
+        let locations = self.lookup_record_index(&key_refs).await?;
+        if locations.is_empty() {
+            return Ok(());
+        }
+
+        let allowed: std::collections::HashSet<(&str, &str)> = locations
+            .values()
+            .map(|loc| (loc.partition_path.as_str(), loc.file_id.as_str()))
+            .collect();
+        file_slices.retain(|fs| allowed.contains(&(fs.partition_path.as_str(), fs.file_id())));
+        Ok(())
+    }
+
+    /// Extract record-key lookup values from equality / `IN` filters on a single-field
+    /// record key. Returns `None` when the table has a composite record key or no such
+    /// filter is present.
+    fn record_index_keys_from_filters(&self, filters: &[Filter]) -> Option<Vec<String>> {
+        let record_key_fields: Vec<String> = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::RecordKeyFields)
+            .into();
+        let [key_field] = record_key_fields.as_slice() else {
+            return None;
+        };
+
+        let mut keys: Vec<String> = Vec::new();
+        for filter in filters {
+            if &filter.field != key_field {
+                continue;
+            }
+            match filter.operator {
+                ExprOperator::Eq | ExprOperator::In => keys.extend(filter.values.iter().cloned()),
+                _ => {}
+            }
+        }
+        if keys.is_empty() { None } else { Some(keys) }
     }
 
     async fn get_file_slices_between_inner(
@@ -681,9 +757,12 @@ impl Table {
             return Ok(Vec::new());
         };
         let base_file_only = self.is_base_file_only(prepared)?;
-        let file_slices = self
+        let mut file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
+        // Read oldest slice first so cross-slice schema reconciliation resolves an evolved
+        // column to the newest commit's name (newest-wins) deterministically.
+        file_slices.sort_by(|a, b| a.creation_instant_time().cmp(b.creation_instant_time()));
         let fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
@@ -695,7 +774,8 @@ impl Table {
                 .map(|f| fg_reader.read_file_slice(f, &fg_options)),
         )
         .await?;
-        Ok(batches)
+        // Reconcile across file slices so schema-evolved files yield a uniform result schema.
+        crate::util::arrow::reconcile_batches(batches)
     }
 
     async fn read_incremental_inner(&self, prepared: &ReadOptions) -> Result<Vec<RecordBatch>> {
@@ -704,9 +784,12 @@ impl Table {
             return Ok(Vec::new());
         };
         let base_file_only = self.is_base_file_only(prepared)?;
-        let file_slices = self
+        let mut file_slices = self
             .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
+        // Read oldest slice first so cross-slice schema reconciliation resolves an evolved
+        // column to the newest commit's name (newest-wins) deterministically.
+        file_slices.sort_by(|a, b| a.creation_instant_time().cmp(b.creation_instant_time()));
         let fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
@@ -719,7 +802,151 @@ impl Table {
                 .map(|f| fg_reader.read_file_slice(f, &fg_options)),
         )
         .await?;
+        // Reconcile across file slices so schema-evolved files yield a uniform result schema.
+        crate::util::arrow::reconcile_batches(batches)
+    }
+
+    /// Read Change Data Capture (CDC) change records for a commit range.
+    ///
+    /// Requires `hoodie.table.cdc.enabled=true`. Returns the persisted change records — each
+    /// carrying an `op` code (see [`crate::cdc::op`]) and before/after images — for the commits
+    /// in the `(start, end]` range resolved from `options` (defaulting to the full timeline).
+    ///
+    /// Supports all supplemental logging modes for both Parquet and log-based (MOR) CDC files:
+    /// `cdc_data_before_after` reads the self-contained change records directly, while
+    /// `cdc_op_key` and `cdc_data_before` reconstruct the before/after images from the merged
+    /// table snapshots at the change commit and the immediately-preceding one.
+    pub async fn read_cdc(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        use crate::config::table::CdcSupplementalLoggingModeValue::{
+            DataBefore, DataBeforeAfter, OpKeyOnly,
+        };
+        use crate::error::CoreError;
+
+        if !crate::cdc::is_cdc_enabled(&self.hudi_configs) {
+            return Err(CoreError::Unsupported(
+                "CDC read requires hoodie.table.cdc.enabled=true".to_string(),
+            ));
+        }
+        let mode = crate::cdc::supplemental_logging_mode(&self.hudi_configs)?;
+
+        let prepared = self.prepare_reader_options(options)?;
+        let Some((start, end)) = self.resolve_incremental_range(&prepared)? else {
+            return Ok(Vec::new());
+        };
+
+        // The full ordered timeline of completed change instants. The immediately-preceding
+        // instant of each in-range commit supplies the before-image for op-key/data-before
+        // reconstruction.
+        let mut instants = self.timeline.get_completed_commits(false).await?;
+        instants.extend(self.timeline.get_completed_deltacommits(false).await?);
+        instants.extend(self.timeline.get_completed_replacecommits(false).await?);
+        instants.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        // Read CDC files with table-level options only (no incremental start/end), so the
+        // per-file read does not apply a commit-time mask to the already-scoped change records.
+        let fg_reader =
+            self.build_file_group_reader(HashMap::new(), std::iter::empty::<(&str, &str)>())?;
+        let read_options = ReadOptions::new();
+        let record_key_field = MetaField::RecordKey.as_ref();
+
+        let mut batches = Vec::new();
+        for i in 0..instants.len() {
+            let instant = &instants[i];
+            let t = instant.timestamp.as_str();
+            if !(t > start.as_str() && t <= end.as_str()) {
+                continue;
+            }
+            let metadata = self.timeline.get_instant_metadata(instant).await?;
+            let cdc_paths = crate::cdc::cdc_file_paths_from_commit_metadata(&metadata);
+            if cdc_paths.is_empty() {
+                continue;
+            }
+
+            match mode {
+                // Self-contained change records — read the CDC files directly.
+                DataBeforeAfter => {
+                    for rel_path in cdc_paths {
+                        batches.push(
+                            self.read_cdc_file(&fg_reader, &rel_path, &read_options)
+                                .await?,
+                        );
+                    }
+                }
+                // Reconstruct before/after images from the table state at this commit and the
+                // immediately-preceding one. (`data_before` also logs the before-image, but
+                // reconstructing it from the prior snapshot yields the same result.)
+                OpKeyOnly | DataBefore => {
+                    let after = self.read_full_snapshot_as_of(t).await?;
+                    let before = if i > 0 {
+                        self.read_full_snapshot_as_of(instants[i - 1].timestamp.as_str())
+                            .await?
+                    } else {
+                        None
+                    };
+                    for rel_path in cdc_paths {
+                        let cdc_batch = self
+                            .read_cdc_file(&fg_reader, &rel_path, &read_options)
+                            .await?;
+                        let (ops, keys) = crate::cdc::extract_ops_and_keys(&cdc_batch)?;
+                        batches.push(crate::cdc::build_change_records(
+                            &ops,
+                            &keys,
+                            after.as_ref(),
+                            before.as_ref(),
+                            record_key_field,
+                            t,
+                        )?);
+                    }
+                }
+            }
+        }
         Ok(batches)
+    }
+
+    /// Read a single CDC file, dispatching by extension: Parquet CDC files are read as a base
+    /// file; log-based (MOR) CDC files are scanned for their CDC data blocks.
+    async fn read_cdc_file(
+        &self,
+        fg_reader: &FileGroupReader,
+        rel_path: &str,
+        read_options: &ReadOptions,
+    ) -> Result<RecordBatch> {
+        if rel_path.to_ascii_lowercase().ends_with(".parquet") {
+            fg_reader
+                .read_file_slice_from_paths(rel_path, Vec::<&str>::new(), read_options)
+                .await
+        } else {
+            fg_reader.read_cdc_log_file(rel_path).await
+        }
+    }
+
+    /// Read the merged snapshot of the whole table as of `timestamp` into a single batch, used to
+    /// supply before/after images for CDC reconstruction. Returns `None` when there are no records.
+    async fn read_full_snapshot_as_of(&self, timestamp: &str) -> Result<Option<RecordBatch>> {
+        let file_slices = self.get_file_slices_inner(timestamp, &[], false).await?;
+        if file_slices.is_empty() {
+            return Ok(None);
+        }
+        let fg_reader =
+            self.build_file_group_reader(HashMap::new(), std::iter::empty::<(&str, &str)>())?;
+        let opts = ReadOptions::new();
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, &opts)),
+        )
+        .await?;
+        let batches: Vec<RecordBatch> = crate::util::arrow::reconcile_batches(batches)?
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect();
+        let Some(first) = batches.first() else {
+            return Ok(None);
+        };
+        let schema = first.schema();
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map(Some)
+            .map_err(crate::error::CoreError::ArrowError)
     }
 
     /// Build the [`ReadOptions`] passed to `FileGroupReader` for a per-slice read,
@@ -792,8 +1019,9 @@ impl Table {
 
     /// Streaming read; dispatches on `options.query_type`.
     ///
-    /// Snapshot streams batches as they are read from each file slice. Incremental
-    /// streaming is not yet supported and returns an `Unsupported` error.
+    /// Both snapshot and incremental stream batches as they are read from each file slice.
+    /// Incremental streaming yields the change records in the `(start, end]` range, applying
+    /// the same commit-time mask as the eager incremental read.
     ///
     /// For MOR file slices with log files, streaming falls back to a collect-and-merge
     /// that yields that file slice's merged result as a single batch.
@@ -818,9 +1046,7 @@ impl Table {
         let prepared = self.prepare_reader_options(options)?;
         match prepared.query_type()? {
             QueryType::Snapshot => self.read_snapshot_stream_inner(&prepared).await,
-            QueryType::Incremental => Err(CoreError::Unsupported(
-                "Streaming for incremental queries is not yet supported".to_string(),
-            )),
+            QueryType::Incremental => self.read_incremental_stream_inner(&prepared).await,
         }
     }
 
@@ -828,16 +1054,49 @@ impl Table {
         &self,
         prepared: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        use futures::stream::{self, StreamExt};
-
         let Some(timestamp) = prepared.end_timestamp() else {
-            return Ok(Box::pin(stream::empty()));
+            return Ok(Box::pin(futures::stream::empty()));
         };
 
         let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
+
+        self.stream_file_slices(prepared, file_slices)
+    }
+
+    async fn read_incremental_stream_inner(
+        &self,
+        prepared: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        let (Some(start), Some(end)) = (prepared.start_timestamp(), prepared.end_timestamp())
+        else {
+            return Ok(Box::pin(futures::stream::empty()));
+        };
+
+        let base_file_only = self.is_base_file_only(prepared)?;
+        let file_slices = self
+            .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
+            .await?;
+
+        // The file group reader is built from `prepared.hudi_options`, which carries the
+        // start/end timestamps; its per-slice reads apply the `(start, end]` commit-time
+        // mask just as the eager incremental path does.
+        self.stream_file_slices(prepared, file_slices)
+    }
+
+    /// Chain per-slice streaming reads of `file_slices` into one batch stream.
+    ///
+    /// Shared by snapshot and incremental streaming: each slice is read lazily via
+    /// [`crate::file_group::reader::FileGroupReader::read_file_slice_stream`], and the
+    /// streams are concatenated, propagating errors to the caller.
+    fn stream_file_slices(
+        &self,
+        prepared: &ReadOptions,
+        file_slices: Vec<FileSlice>,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        use futures::stream::{self, StreamExt};
 
         if file_slices.is_empty() {
             return Ok(Box::pin(stream::empty()));
@@ -855,8 +1114,8 @@ impl Table {
         let fg_options_template = self.options_for_file_group(prepared);
         let projection = fg_options_template.projection.clone();
         let row_filters = fg_options_template.filters.clone();
-        // Carry batch_size in hudi_options if set; everything else (timestamps,
-        // query_type) is irrelevant to the per-slice FG-reader read.
+        // Carry batch_size in hudi_options if set; commit-time filtering is driven by the
+        // file group reader's own configs (built above from `prepared.hudi_options`).
         let mut per_slice_hudi_options: HashMap<String, String> = HashMap::new();
         if let Some(bs) = fg_options_template.batch_size()? {
             per_slice_hudi_options.insert(
@@ -1463,6 +1722,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_cdc_errors_when_cdc_disabled() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = Table::new(base_url.path()).await.unwrap();
+        let err = table.read_cdc(&ReadOptions::new()).await.unwrap_err();
+        assert!(matches!(err, CoreError::Unsupported(_)));
+        assert!(err.to_string().contains("hoodie.table.cdc.enabled"));
+    }
+
+    #[tokio::test]
+    async fn read_cdc_op_key_mode_without_cdc_files_is_empty() {
+        // op-key reconstruction is supported; a table that wrote no CDC files yields no changes.
+        use crate::config::table::HudiTableConfig::{CdcEnabled, CdcSupplementalLoggingMode};
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = Table::new_with_options(
+            base_url.path(),
+            [
+                (CdcEnabled.as_ref(), "true"),
+                (CdcSupplementalLoggingMode.as_ref(), "cdc_op_key"),
+            ],
+        )
+        .await
+        .unwrap();
+        let batches = table.read_cdc(&ReadOptions::new()).await.unwrap();
+        assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
     async fn hudi_table_read_snapshot_stream_returns_batches_with_options() -> Result<()> {
         use futures::TryStreamExt;
 
@@ -1538,19 +1824,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_read_stream_errors_on_incremental() {
+    async fn hudi_table_read_stream_incremental_matches_eager() {
+        use futures::StreamExt;
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let result = hudi_table
-            .read_stream(&ReadOptions::new().with_query_type(QueryType::Incremental))
-            .await;
-        match result {
-            Ok(_) => panic!("incremental streaming must error"),
-            Err(e) => {
-                assert!(matches!(e, CoreError::Unsupported(_)));
-                assert!(e.to_string().contains("not yet supported"));
-            }
+        let options = ReadOptions::new().with_query_type(QueryType::Incremental);
+
+        let eager_rows: usize = hudi_table
+            .read(&options)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+
+        let mut stream = hudi_table.read_stream(&options).await.unwrap();
+        let mut stream_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            stream_rows += batch.unwrap().num_rows();
         }
+
+        assert_eq!(stream_rows, eager_rows);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_pruned_by_record_index() {
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let hudi_table = Table::new(&table_path).await.unwrap();
+
+        // Baseline: no filter returns file slices across all partitions.
+        let all_slices = hudi_table
+            .get_file_slices(&ReadOptions::new())
+            .await
+            .unwrap();
+        assert!(
+            all_slices.len() > 1,
+            "fixture should have multiple file slices"
+        );
+
+        // A known record key (uuid) resolves to exactly one file group via the RLI.
+        let key = "334e26e9-8355-45cc-97c6-c31daf0df330";
+        let location = hudi_table.lookup_record_index(&[key]).await.unwrap();
+        let loc = location.get(key).expect("key should be indexed").clone();
+
+        let pruned = hudi_table
+            .get_file_slices(
+                &ReadOptions::new()
+                    .with_filters([("uuid", "=", key)])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pruned.len(),
+            1,
+            "record-index lookup should leave a single file slice"
+        );
+        assert_eq!(pruned[0].partition_path, loc.partition_path);
+        assert_eq!(pruned[0].file_id(), loc.file_id.as_str());
+
+        // An unknown key resolves to nothing, so RLI pruning is skipped (the row mask
+        // downstream still yields no rows); slices are not dropped at planning time.
+        let absent = hudi_table
+            .get_file_slices(
+                &ReadOptions::new()
+                    .with_filters([("uuid", "=", "00000000-0000-0000-0000-000000000000")])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(absent.len(), all_slices.len());
     }
 
     #[tokio::test]
@@ -1634,7 +1978,7 @@ mod tests {
         assert_eq!(p10.len(), 1, "Partition 10 should have 1 file slice");
         let file_slice = p10[0];
         assert_eq!(
-            file_slice.base_file.file_name(),
+            file_slice.base_file.as_ref().unwrap().file_name(),
             "92e64357-e4d1-4639-a9d3-c3535829d0aa-0_1-53-79_20250121000647668.parquet"
         );
         assert_eq!(file_slice.log_files.len(), 1);
@@ -1775,17 +2119,35 @@ mod tests {
         // size comes from HoodieWriteStat.fileSizeInBytes; byte_size and num_records
         // are estimated from the cached FileStatsEstimator (seeded from a sample
         // base file in commit metadata at or before end_timestamp).
-        let m0 = file_slice_0.base_file.file_metadata.as_ref().unwrap();
+        let m0 = file_slice_0
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m0.size, 440878);
         assert_eq!(m0.byte_size, 326703);
         assert_eq!(m0.num_records, 458);
 
-        let m1 = file_slice_1.base_file.file_metadata.as_ref().unwrap();
+        let m1 = file_slice_1
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m1.size, 440616);
         assert_eq!(m1.byte_size, 326509);
         assert_eq!(m1.num_records, 458);
 
-        let m2 = file_slice_2.base_file.file_metadata.as_ref().unwrap();
+        let m2 = file_slice_2
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(m2.size, 440638);
         assert_eq!(m2.byte_size, 326525);
         assert_eq!(m2.num_records, 458);
@@ -2038,7 +2400,13 @@ mod tests {
 
         // Verify file metadata is populated from MDT with estimated stats
         for fsl in &file_slices {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }

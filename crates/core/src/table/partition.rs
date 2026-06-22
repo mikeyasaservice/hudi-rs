@@ -27,8 +27,8 @@ use crate::keygen::timestamp_based::TimestampBasedKeyGenerator;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::{Field, Schema};
 
-use crate::config::table::HudiTableConfig::{KeyGeneratorClass, KeyGeneratorType, PartitionFields};
-use crate::keygen::is_timestamp_based_keygen;
+use crate::config::table::HudiTableConfig::PartitionFields;
+use crate::keygen::{KeyGeneratorType, is_timestamp_based_keygen};
 use crate::metadata::meta_field::MetaField;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,24 +71,12 @@ pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> Result<bool> {
         !partition_fields.is_empty()
     };
 
-    let uses_non_partitioned_key_gen = hudi_configs
-        .try_get(KeyGeneratorClass)?
-        .map(|key_gen| {
-            let key_gen_str: String = key_gen.into();
-            key_gen_str == "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
-        })
-        .unwrap_or(false);
+    let uses_non_partitioned_key_gen = matches!(
+        KeyGeneratorType::resolve(hudi_configs)?,
+        Some(KeyGeneratorType::NonPartition)
+    );
 
-    let uses_non_partitioned_type = hudi_configs
-        .try_get(KeyGeneratorType)?
-        .map(|v| {
-            let s: String = v.into();
-            let upper = s.to_uppercase();
-            upper == "NON_PARTITION" || upper == "NON_PARTITION_AVRO"
-        })
-        .unwrap_or(false);
-
-    Ok(has_partition_fields && !uses_non_partitioned_key_gen && !uses_non_partitioned_type)
+    Ok(has_partition_fields && !uses_non_partitioned_key_gen)
 }
 
 /// A partition pruner that filters partitions based on the partition path and its filters.

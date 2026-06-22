@@ -66,7 +66,9 @@ impl Decoder {
 
         let reader = reader.by_ref().take(content_length);
         match block_type {
-            BlockType::AvroData => self
+            // CDC data blocks (MOR CDC) are Avro-encoded change records, decoded the same way
+            // as a regular Avro data block; the CDC read path interprets the resulting columns.
+            BlockType::AvroData | BlockType::CdcData => self
                 .decode_avro_record_content(reader, header)
                 .map(LogBlockContent::Records),
             BlockType::ParquetData => self
