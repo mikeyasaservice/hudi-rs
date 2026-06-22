@@ -308,6 +308,39 @@ impl FileGroupReader {
         apply_eager_options(&options, merged)
     }
 
+    /// Read a log-based CDC file: scan its CDC data log blocks and return the change records.
+    ///
+    /// Unlike the data read path, change records are returned as-is (no record merge): each block
+    /// is a list of CDC change records. Blocks are reconciled to a common schema and concatenated.
+    pub async fn read_cdc_log_file(&self, relative_path: &str) -> Result<RecordBatch> {
+        let instant_range = self.create_instant_range_for_log_file_scan()?;
+        let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            .scan(vec![relative_path.to_string()], &instant_range)
+            .await?;
+        let batches = match scan_result {
+            ScanResult::RecordBatches(b) => b,
+            ScanResult::Empty => {
+                return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
+            }
+            ScanResult::HFileRecords(_) => {
+                return Err(CoreError::LogBlockError(
+                    "Unexpected HFile records in CDC log file".to_string(),
+                ));
+            }
+        };
+        if batches.data_batches.is_empty() {
+            return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
+        }
+        let schemas: Vec<SchemaRef> = batches.data_batches.iter().map(|b| b.schema()).collect();
+        let target = reconcile_schemas(&schemas);
+        let adapted: Vec<RecordBatch> = batches
+            .data_batches
+            .iter()
+            .map(|b| adapt_batch_to_schema(b, &target))
+            .collect::<Result<_>>()?;
+        arrow_select::concat::concat_batches(&target, &adapted).map_err(CoreError::ArrowError)
+    }
+
     /// Reads a file slice from a base file and a list of log files.
     ///
     /// `options.filters` are applied as a row-level mask after reading;

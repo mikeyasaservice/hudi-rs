@@ -768,7 +768,8 @@ impl Table {
                 .map(|f| fg_reader.read_file_slice(f, &fg_options)),
         )
         .await?;
-        Ok(batches)
+        // Reconcile across file slices so schema-evolved files yield a uniform result schema.
+        crate::util::arrow::reconcile_batches(batches)
     }
 
     async fn read_incremental_inner(&self, prepared: &ReadOptions) -> Result<Vec<RecordBatch>> {
@@ -792,7 +793,8 @@ impl Table {
                 .map(|f| fg_reader.read_file_slice(f, &fg_options)),
         )
         .await?;
-        Ok(batches)
+        // Reconcile across file slices so schema-evolved files yield a uniform result schema.
+        crate::util::arrow::reconcile_batches(batches)
     }
 
     /// Read Change Data Capture (CDC) change records for a commit range.
@@ -801,10 +803,10 @@ impl Table {
     /// carrying an `op` code (see [`crate::cdc::op`]) and before/after images — for the commits
     /// in the `(start, end]` range resolved from `options` (defaulting to the full timeline).
     ///
-    /// Currently supports the self-contained `cdc_data_before_after` supplemental logging mode
-    /// with Parquet CDC files. Other modes — which require reconstructing the before/after images
-    /// from base and log files — and log-based CDC files are not yet implemented and return an
-    /// [`CoreError::Unsupported`] error.
+    /// Currently supports the self-contained `cdc_data_before_after` supplemental logging mode,
+    /// for both Parquet CDC files and log-based (MOR) CDC files. Other modes — which require
+    /// reconstructing the before/after images from base and log files — are not yet implemented
+    /// and return an [`CoreError::Unsupported`] error.
     pub async fn read_cdc(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
         use crate::error::CoreError;
 
@@ -847,14 +849,14 @@ impl Table {
         for instant in instants {
             let metadata = self.timeline.get_instant_metadata(&instant).await?;
             for rel_path in crate::cdc::cdc_file_paths_from_commit_metadata(&metadata) {
-                if !rel_path.to_ascii_lowercase().ends_with(".parquet") {
-                    return Err(CoreError::Unsupported(format!(
-                        "CDC file '{rel_path}' is not Parquet; log-based CDC files are not yet supported"
-                    )));
-                }
-                let batch = fg_reader
-                    .read_file_slice_from_paths(&rel_path, Vec::<&str>::new(), &read_options)
-                    .await?;
+                let batch = if rel_path.to_ascii_lowercase().ends_with(".parquet") {
+                    fg_reader
+                        .read_file_slice_from_paths(&rel_path, Vec::<&str>::new(), &read_options)
+                        .await?
+                } else {
+                    // Log-based CDC file (MOR): scan its CDC data blocks.
+                    fg_reader.read_cdc_log_file(&rel_path).await?
+                };
                 batches.push(batch);
             }
         }

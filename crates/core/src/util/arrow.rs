@@ -250,6 +250,27 @@ pub fn adapt_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Result<
     RecordBatch::try_new(target.clone(), columns).map_err(CoreError::ArrowError)
 }
 
+/// Reconcile a set of batches (read from possibly schema-evolved files) to one common schema, so
+/// a single result set has a uniform schema. Returns the batches unchanged when there are fewer
+/// than two or they already share a schema; otherwise each is adapted to the reconciled union.
+pub fn reconcile_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    if batches.len() < 2 {
+        return Ok(batches);
+    }
+    let schemas: Vec<SchemaRef> = batches.iter().map(|b| b.schema()).collect();
+    let target = reconcile_schemas(&schemas);
+    if batches
+        .iter()
+        .all(|b| b.schema().fields() == target.fields())
+    {
+        return Ok(batches);
+    }
+    batches
+        .iter()
+        .map(|b| adapt_batch_to_schema(b, &target))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +365,55 @@ mod tests {
         assert_eq!(vs.values(), &[10, 20]);
         // Missing column filled with nulls.
         assert_eq!(adapted.column(2).null_count(), 2);
+    }
+
+    #[test]
+    fn test_reconcile_batches_unifies_evolved_batches() {
+        // One batch has [id], another adds [city]; both should end up with [id, city].
+        let b1 = RecordBatch::try_new(
+            schema(&[("id", DataType::Int32, false)]),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema(&[
+                ("id", DataType::Int32, false),
+                ("city", DataType::Utf8, true),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["paris"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let out = reconcile_batches(vec![b1, b2]).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].schema().fields(), out[1].schema().fields());
+        let out0_schema = out[0].schema();
+        let names: Vec<&str> = out0_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["id", "city"]);
+        // The first batch had no `city`, so it is null-filled.
+        assert_eq!(out[0].column(1).null_count(), 2);
+    }
+
+    #[test]
+    fn test_reconcile_batches_noop_for_uniform_or_single() {
+        let s = schema(&[("id", DataType::Int32, false)]);
+        let b = RecordBatch::try_new(
+            s.clone(),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+        // Single batch: returned as-is.
+        assert_eq!(reconcile_batches(vec![b.clone()]).unwrap().len(), 1);
+        // Two identical-schema batches: unchanged.
+        let out = reconcile_batches(vec![b.clone(), b]).unwrap();
+        assert_eq!(out[0].schema().fields(), s.fields());
     }
 
     #[test]
