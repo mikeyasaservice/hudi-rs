@@ -33,7 +33,14 @@ use crate::config::HudiConfigs;
 use crate::config::table::CdcSupplementalLoggingModeValue;
 use crate::config::table::HudiTableConfig::{CdcEnabled, CdcSupplementalLoggingMode};
 use crate::error::CoreError;
+use crate::util::arrow::{adapt_batch_to_schema, reconcile_schemas};
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt32Array, new_null_array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// CDC change-operation codes as written by Hudi into the `op` column of a change record.
 pub mod op {
@@ -101,10 +108,172 @@ pub fn cdc_file_paths_from_commit_metadata(commit_metadata: &Map<String, Value>)
     paths
 }
 
+/// The Arrow field name a CDC log/file uses for the change operation code.
+pub const CDC_OP_FIELD: &str = "op";
+/// The Arrow field name a CDC log/file uses for the changed record's key.
+pub const CDC_RECORD_KEY_FIELD: &str = "record_key";
+
+/// The record (struct) schema reconciled across the available before/after snapshots.
+fn record_schema(after: Option<&RecordBatch>, before: Option<&RecordBatch>) -> SchemaRef {
+    let schemas: Vec<SchemaRef> = [after, before]
+        .into_iter()
+        .flatten()
+        .map(|b| b.schema())
+        .collect();
+    reconcile_schemas(&schemas)
+}
+
+/// Gather one struct value per requested key from `snapshot` (adapted to `record_schema`),
+/// emitting a null struct where the key is `None` or not found. Used to build the before/after
+/// image columns of the change records.
+fn gather_records_by_key(
+    snapshot: Option<&RecordBatch>,
+    record_schema: &SchemaRef,
+    keys: &[Option<&str>],
+    record_key_field: &str,
+) -> Result<ArrayRef> {
+    let struct_type = DataType::Struct(record_schema.fields().clone());
+    let Some(snapshot) = snapshot else {
+        return Ok(new_null_array(&struct_type, keys.len()));
+    };
+    let adapted = adapt_batch_to_schema(snapshot, record_schema)?;
+    let key_array = adapted
+        .column_by_name(record_key_field)
+        .ok_or_else(|| {
+            CoreError::Schema(format!(
+                "CDC snapshot is missing record key field '{record_key_field}'"
+            ))
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            CoreError::Schema(format!(
+                "CDC record key field '{record_key_field}' is not a string"
+            ))
+        })?;
+
+    let mut index: HashMap<&str, u32> = HashMap::with_capacity(adapted.num_rows());
+    for i in 0..adapted.num_rows() {
+        if key_array.is_valid(i) {
+            // Later rows win, matching last-write semantics of the merged snapshot.
+            index.insert(key_array.value(i), i as u32);
+        }
+    }
+    let indices: UInt32Array = keys
+        .iter()
+        .map(|k| k.and_then(|k| index.get(k).copied()))
+        .collect();
+    let struct_full = StructArray::from(adapted);
+    arrow::compute::take(&struct_full, &indices, None).map_err(CoreError::ArrowError)
+}
+
+/// Build CDC change records from per-commit `(op, record_key)` pairs and the file-group snapshots.
+///
+/// `after_snapshot` is the table state at the change commit and `before_snapshot` the state at the
+/// prior commit, each indexed by `record_key_field`. For each pair: an insert ([`op::INSERT`])
+/// takes its after-image from `after_snapshot` and has no before; an update ([`op::UPDATE`]) takes
+/// after from `after_snapshot` and before from `before_snapshot`; a delete ([`op::DELETE`]) takes
+/// only the before-image. The output columns are `op`, `ts_ms` (the commit time), and
+/// `before`/`after` structs of the reconciled record schema. This reconstruction backs the
+/// `cdc_op_key` and `cdc_data_before` supplemental logging modes.
+pub fn build_change_records(
+    ops: &[String],
+    keys: &[String],
+    after_snapshot: Option<&RecordBatch>,
+    before_snapshot: Option<&RecordBatch>,
+    record_key_field: &str,
+    commit_time: &str,
+) -> Result<RecordBatch> {
+    if ops.len() != keys.len() {
+        return Err(CoreError::Schema(format!(
+            "CDC op count ({}) does not match record key count ({})",
+            ops.len(),
+            keys.len()
+        )));
+    }
+    let record_schema = record_schema(after_snapshot, before_snapshot);
+
+    let after_keys: Vec<Option<&str>> = ops
+        .iter()
+        .zip(keys)
+        .map(|(op, k)| {
+            if op == op::DELETE {
+                None
+            } else {
+                Some(k.as_str())
+            }
+        })
+        .collect();
+    let before_keys: Vec<Option<&str>> = ops
+        .iter()
+        .zip(keys)
+        .map(|(op, k)| {
+            if op == op::INSERT {
+                None
+            } else {
+                Some(k.as_str())
+            }
+        })
+        .collect();
+
+    let after = gather_records_by_key(
+        after_snapshot,
+        &record_schema,
+        &after_keys,
+        record_key_field,
+    )?;
+    let before = gather_records_by_key(
+        before_snapshot,
+        &record_schema,
+        &before_keys,
+        record_key_field,
+    )?;
+
+    let op_array = StringArray::from(ops.to_vec());
+    let ts_array = StringArray::from(vec![commit_time.to_string(); ops.len()]);
+    let struct_type = DataType::Struct(record_schema.fields().clone());
+    let schema = SchemaRef::from(Schema::new(vec![
+        Field::new(CDC_OP_FIELD, DataType::Utf8, false),
+        Field::new("ts_ms", DataType::Utf8, false),
+        Field::new("before", struct_type.clone(), true),
+        Field::new("after", struct_type, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(op_array), Arc::new(ts_array), before, after],
+    )
+    .map_err(CoreError::ArrowError)
+}
+
+/// Extract the `(op, record_key)` columns from a CDC file's records.
+pub fn extract_ops_and_keys(cdc_records: &RecordBatch) -> Result<(Vec<String>, Vec<String>)> {
+    let string_col = |name: &str| -> Result<Vec<String>> {
+        let array = cdc_records
+            .column_by_name(name)
+            .ok_or_else(|| {
+                CoreError::Schema(format!("CDC records are missing the '{name}' column"))
+            })?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| CoreError::Schema(format!("CDC '{name}' column is not a string")))?;
+        Ok((0..array.len())
+            .map(|i| {
+                if array.is_valid(i) {
+                    array.value(i).to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .collect())
+    };
+    Ok((string_col(CDC_OP_FIELD)?, string_col(CDC_RECORD_KEY_FIELD)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::table::HudiTableConfig::{CdcEnabled, CdcSupplementalLoggingMode};
+    use arrow_array::Int64Array;
 
     #[test]
     fn test_is_cdc_enabled_defaults_false() {
@@ -169,6 +338,117 @@ mod tests {
         );
         let paths = cdc_file_paths_from_commit_metadata(&metadata);
         assert_eq!(paths, vec!["2024/01/01/.cdc/f0.parquet"]);
+    }
+
+    fn snapshot(keys: &[&str], values: &[i64]) -> RecordBatch {
+        let schema = SchemaRef::from(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())) as ArrayRef,
+                Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn struct_value_col(batch: &RecordBatch, name: &str) -> Int64Array {
+        let s = batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        s.column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn test_build_change_records_reconstructs_before_and_after() {
+        // After commit T: A=10 (updated), B=20 (inserted). Before (T_prev): A=1, C=3.
+        let after = snapshot(&["A", "B"], &[10, 20]);
+        let before = snapshot(&["A", "C"], &[1, 3]);
+
+        let ops = vec![
+            op::UPDATE.to_string(),
+            op::INSERT.to_string(),
+            op::DELETE.to_string(),
+        ];
+        let keys = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+
+        let out = build_change_records(
+            &ops,
+            &keys,
+            Some(&after),
+            Some(&before),
+            "_hoodie_record_key",
+            "20240101000000",
+        )
+        .unwrap();
+
+        assert_eq!(out.num_rows(), 3);
+        let op_col = out
+            .column_by_name("op")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(op_col.value(0), "u");
+        assert_eq!(op_col.value(2), "d");
+
+        let after_vals = struct_value_col(&out, "after");
+        // update A -> after 10, insert B -> after 20, delete C -> after null
+        assert_eq!(after_vals.value(0), 10);
+        assert_eq!(after_vals.value(1), 20);
+        assert!(out.column_by_name("after").unwrap().is_null(2));
+
+        let before_vals = struct_value_col(&out, "before");
+        // update A -> before 1, insert B -> before null, delete C -> before 3
+        assert_eq!(before_vals.value(0), 1);
+        assert!(out.column_by_name("before").unwrap().is_null(1));
+        assert_eq!(before_vals.value(2), 3);
+    }
+
+    #[test]
+    fn test_build_change_records_handles_missing_before_snapshot() {
+        // First commit (no prior state): inserts only, before all null.
+        let after = snapshot(&["A", "B"], &[1, 2]);
+        let ops = vec![op::INSERT.to_string(), op::INSERT.to_string()];
+        let keys = vec!["A".to_string(), "B".to_string()];
+        let out = build_change_records(&ops, &keys, Some(&after), None, "_hoodie_record_key", "t0")
+            .unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let before = out.column_by_name("before").unwrap();
+        assert_eq!(before.null_count(), 2);
+        let after_vals = struct_value_col(&out, "after");
+        assert_eq!(after_vals.value(0), 1);
+        assert_eq!(after_vals.value(1), 2);
+    }
+
+    #[test]
+    fn test_extract_ops_and_keys() {
+        let schema = SchemaRef::from(Schema::new(vec![
+            Field::new("op", DataType::Utf8, false),
+            Field::new("record_key", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["i", "d"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A", "B"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let (ops, keys) = extract_ops_and_keys(&batch).unwrap();
+        assert_eq!(ops, vec!["i", "d"]);
+        assert_eq!(keys, vec!["A", "B"]);
     }
 
     #[test]

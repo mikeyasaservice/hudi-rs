@@ -98,9 +98,7 @@ pub use crate::config::read_options::{QueryType, ReadOptions};
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
-use crate::config::table::{
-    BaseFileFormatValue, CdcSupplementalLoggingModeValue, HudiTableConfig, TableTypeValue,
-};
+use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
 use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
@@ -803,11 +801,14 @@ impl Table {
     /// carrying an `op` code (see [`crate::cdc::op`]) and before/after images — for the commits
     /// in the `(start, end]` range resolved from `options` (defaulting to the full timeline).
     ///
-    /// Currently supports the self-contained `cdc_data_before_after` supplemental logging mode,
-    /// for both Parquet CDC files and log-based (MOR) CDC files. Other modes — which require
-    /// reconstructing the before/after images from base and log files — are not yet implemented
-    /// and return an [`CoreError::Unsupported`] error.
+    /// Supports all supplemental logging modes for both Parquet and log-based (MOR) CDC files:
+    /// `cdc_data_before_after` reads the self-contained change records directly, while
+    /// `cdc_op_key` and `cdc_data_before` reconstruct the before/after images from the merged
+    /// table snapshots at the change commit and the immediately-preceding one.
     pub async fn read_cdc(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        use crate::config::table::CdcSupplementalLoggingModeValue::{
+            DataBefore, DataBeforeAfter, OpKeyOnly,
+        };
         use crate::error::CoreError;
 
         if !crate::cdc::is_cdc_enabled(&self.hudi_configs) {
@@ -816,27 +817,18 @@ impl Table {
             ));
         }
         let mode = crate::cdc::supplemental_logging_mode(&self.hudi_configs)?;
-        if mode != CdcSupplementalLoggingModeValue::DataBeforeAfter {
-            return Err(CoreError::Unsupported(format!(
-                "CDC supplemental logging mode '{}' is not yet supported; \
-                 only '{}' (self-contained change records) is",
-                mode.as_ref(),
-                CdcSupplementalLoggingModeValue::DataBeforeAfter.as_ref()
-            )));
-        }
 
         let prepared = self.prepare_reader_options(options)?;
         let Some((start, end)) = self.resolve_incremental_range(&prepared)? else {
             return Ok(Vec::new());
         };
 
-        // Completed commit / deltacommit / replacecommit instants in the (start, end] range.
+        // The full ordered timeline of completed change instants. The immediately-preceding
+        // instant of each in-range commit supplies the before-image for op-key/data-before
+        // reconstruction.
         let mut instants = self.timeline.get_completed_commits(false).await?;
         instants.extend(self.timeline.get_completed_deltacommits(false).await?);
         instants.extend(self.timeline.get_completed_replacecommits(false).await?);
-        instants.retain(|i| {
-            i.timestamp.as_str() > start.as_str() && i.timestamp.as_str() <= end.as_str()
-        });
         instants.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
         // Read CDC files with table-level options only (no incremental start/end), so the
@@ -844,23 +836,106 @@ impl Table {
         let fg_reader =
             self.build_file_group_reader(HashMap::new(), std::iter::empty::<(&str, &str)>())?;
         let read_options = ReadOptions::new();
+        let record_key_field = MetaField::RecordKey.as_ref();
 
         let mut batches = Vec::new();
-        for instant in instants {
-            let metadata = self.timeline.get_instant_metadata(&instant).await?;
-            for rel_path in crate::cdc::cdc_file_paths_from_commit_metadata(&metadata) {
-                let batch = if rel_path.to_ascii_lowercase().ends_with(".parquet") {
-                    fg_reader
-                        .read_file_slice_from_paths(&rel_path, Vec::<&str>::new(), &read_options)
-                        .await?
-                } else {
-                    // Log-based CDC file (MOR): scan its CDC data blocks.
-                    fg_reader.read_cdc_log_file(&rel_path).await?
-                };
-                batches.push(batch);
+        for i in 0..instants.len() {
+            let instant = &instants[i];
+            let t = instant.timestamp.as_str();
+            if !(t > start.as_str() && t <= end.as_str()) {
+                continue;
+            }
+            let metadata = self.timeline.get_instant_metadata(instant).await?;
+            let cdc_paths = crate::cdc::cdc_file_paths_from_commit_metadata(&metadata);
+            if cdc_paths.is_empty() {
+                continue;
+            }
+
+            match mode {
+                // Self-contained change records — read the CDC files directly.
+                DataBeforeAfter => {
+                    for rel_path in cdc_paths {
+                        batches.push(
+                            self.read_cdc_file(&fg_reader, &rel_path, &read_options)
+                                .await?,
+                        );
+                    }
+                }
+                // Reconstruct before/after images from the table state at this commit and the
+                // immediately-preceding one. (`data_before` also logs the before-image, but
+                // reconstructing it from the prior snapshot yields the same result.)
+                OpKeyOnly | DataBefore => {
+                    let after = self.read_full_snapshot_as_of(t).await?;
+                    let before = if i > 0 {
+                        self.read_full_snapshot_as_of(instants[i - 1].timestamp.as_str())
+                            .await?
+                    } else {
+                        None
+                    };
+                    for rel_path in cdc_paths {
+                        let cdc_batch = self
+                            .read_cdc_file(&fg_reader, &rel_path, &read_options)
+                            .await?;
+                        let (ops, keys) = crate::cdc::extract_ops_and_keys(&cdc_batch)?;
+                        batches.push(crate::cdc::build_change_records(
+                            &ops,
+                            &keys,
+                            after.as_ref(),
+                            before.as_ref(),
+                            record_key_field,
+                            t,
+                        )?);
+                    }
+                }
             }
         }
         Ok(batches)
+    }
+
+    /// Read a single CDC file, dispatching by extension: Parquet CDC files are read as a base
+    /// file; log-based (MOR) CDC files are scanned for their CDC data blocks.
+    async fn read_cdc_file(
+        &self,
+        fg_reader: &FileGroupReader,
+        rel_path: &str,
+        read_options: &ReadOptions,
+    ) -> Result<RecordBatch> {
+        if rel_path.to_ascii_lowercase().ends_with(".parquet") {
+            fg_reader
+                .read_file_slice_from_paths(rel_path, Vec::<&str>::new(), read_options)
+                .await
+        } else {
+            fg_reader.read_cdc_log_file(rel_path).await
+        }
+    }
+
+    /// Read the merged snapshot of the whole table as of `timestamp` into a single batch, used to
+    /// supply before/after images for CDC reconstruction. Returns `None` when there are no records.
+    async fn read_full_snapshot_as_of(&self, timestamp: &str) -> Result<Option<RecordBatch>> {
+        let file_slices = self.get_file_slices_inner(timestamp, &[], false).await?;
+        if file_slices.is_empty() {
+            return Ok(None);
+        }
+        let fg_reader =
+            self.build_file_group_reader(HashMap::new(), std::iter::empty::<(&str, &str)>())?;
+        let opts = ReadOptions::new();
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, &opts)),
+        )
+        .await?;
+        let batches: Vec<RecordBatch> = crate::util::arrow::reconcile_batches(batches)?
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect();
+        let Some(first) = batches.first() else {
+            return Ok(None);
+        };
+        let schema = first.schema();
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map(Some)
+            .map_err(crate::error::CoreError::ArrowError)
     }
 
     /// Build the [`ReadOptions`] passed to `FileGroupReader` for a per-slice read,
@@ -1645,7 +1720,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_cdc_errors_for_unsupported_supplemental_mode() {
+    async fn read_cdc_op_key_mode_without_cdc_files_is_empty() {
+        // op-key reconstruction is supported; a table that wrote no CDC files yields no changes.
         use crate::config::table::HudiTableConfig::{CdcEnabled, CdcSupplementalLoggingMode};
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let table = Table::new_with_options(
@@ -1657,9 +1733,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = table.read_cdc(&ReadOptions::new()).await.unwrap_err();
-        assert!(matches!(err, CoreError::Unsupported(_)));
-        assert!(err.to_string().contains("not yet supported"));
+        let batches = table.read_cdc(&ReadOptions::new()).await.unwrap();
+        assert!(batches.is_empty());
     }
 
     #[tokio::test]
