@@ -45,7 +45,7 @@ use crate::util::arrow::{adapt_batch_to_schema, project_batch_by_names, reconcil
 use arrow::compute::and;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryFutureExt};
 use std::collections::HashMap;
@@ -225,6 +225,35 @@ impl FileGroupReader {
             .await
     }
 
+    /// Drop columns that `hoodie.datasource.write.drop.partition.columns` removed from data files.
+    ///
+    /// Schema reconciliation unions base and log schemas, but a log block may still carry a
+    /// partition column that was dropped from the base file. Resurfacing it would make a dropped
+    /// partition column readable, so it is excluded from the merge target when the config is set.
+    fn exclude_dropped_partition_columns(&self, schema: SchemaRef) -> SchemaRef {
+        let drops: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
+            .into();
+        if !drops {
+            return schema;
+        }
+        let dropped = crate::keygen::partition_column_names(&self.hudi_configs);
+        if dropped.is_empty() {
+            return schema;
+        }
+        let fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .filter(|f| !dropped.iter().any(|d| d == f.name()))
+            .cloned()
+            .collect();
+        if fields.len() == schema.fields().len() {
+            return schema;
+        }
+        SchemaRef::from(Schema::new(fields))
+    }
+
     /// Read a log-only file slice (no base file): scan and merge the log files alone.
     ///
     /// The merge schema is taken from the first log data block. Returns an error if the
@@ -262,7 +291,7 @@ impl FileGroupReader {
             .iter()
             .map(|b| b.schema())
             .collect();
-        let target = reconcile_schemas(&schemas);
+        let target = self.exclude_dropped_partition_columns(reconcile_schemas(&schemas));
         let mut adapted = RecordBatches::new_with_capacity(
             log_batches.num_data_batches(),
             log_batches.num_delete_batches(),
@@ -328,7 +357,7 @@ impl FileGroupReader {
                 Vec::with_capacity(log_batches.num_data_batches() + 1);
             schemas.push(base_batch.schema());
             schemas.extend(log_batches.data_batches.iter().map(|b| b.schema()));
-            let target = reconcile_schemas(&schemas);
+            let target = self.exclude_dropped_partition_columns(reconcile_schemas(&schemas));
 
             let mut all_batches = RecordBatches::new_with_capacity(
                 log_batches.num_data_batches() + 1,
