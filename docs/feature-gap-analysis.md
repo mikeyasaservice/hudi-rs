@@ -144,6 +144,16 @@ generators. These deliver the largest query-side wins, build on infrastructure a
 codebase (HFile reader, MDT record-type enums, file pruner), and keep the project's read-first
 focus.
 
+**Status: implemented.** All Tier 1 items have landed. Two carry scoped boundaries:
+
+- **CDC reads**: the self-contained `cdc_data_before_after` supplemental-logging mode (Parquet CDC
+  files) is implemented via `Table::read_cdc`; modes that require reconstructing before/after
+  images from base/log files, and log-based CDC files, return an `Unsupported` error. End-to-end
+  change-stream behavior is not validated by a fixture (the repo has none and hudi-rs is
+  read-only), so the storage-agnostic logic is unit-tested instead.
+- **Schema evolution**: add/drop/reorder/numeric-type-promotion by column name are reconciled in
+  the merge path; column renames (needing Hudi internal-schema column IDs) are not yet handled.
+
 ### Tier 2 — read-side, medium value or larger effort
 
 Additional merge modes + multiple ordering fields; LSM archived-timeline reader; broader timeline
