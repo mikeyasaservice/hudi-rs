@@ -93,6 +93,11 @@ mod listing;
 pub mod partition;
 mod validation;
 
+#[cfg(test)]
+mod fixture;
+#[cfg(test)]
+mod schema_evolution_cdc_tests;
+
 pub use crate::config::read_options::{QueryType, ReadOptions};
 
 use crate::Result;
@@ -752,9 +757,12 @@ impl Table {
             return Ok(Vec::new());
         };
         let base_file_only = self.is_base_file_only(prepared)?;
-        let file_slices = self
+        let mut file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
+        // Read oldest slice first so cross-slice schema reconciliation resolves an evolved
+        // column to the newest commit's name (newest-wins) deterministically.
+        file_slices.sort_by(|a, b| a.creation_instant_time().cmp(b.creation_instant_time()));
         let fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
@@ -776,9 +784,12 @@ impl Table {
             return Ok(Vec::new());
         };
         let base_file_only = self.is_base_file_only(prepared)?;
-        let file_slices = self
+        let mut file_slices = self
             .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
+        // Read oldest slice first so cross-slice schema reconciliation resolves an evolved
+        // column to the newest commit's name (newest-wins) deterministically.
+        file_slices.sort_by(|a, b| a.creation_instant_time().cmp(b.creation_instant_time()));
         let fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
