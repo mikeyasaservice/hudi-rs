@@ -166,14 +166,40 @@ fn widen_types(a: &DataType, b: &DataType) -> DataType {
     }
 }
 
+/// Arrow field-metadata key under which the Parquet reader records a column's Parquet field id.
+/// Hudi's schema-on-read tables write stable field ids, which lets reconciliation track a column
+/// across a rename (the id stays the same while the name changes).
+const PARQUET_FIELD_ID_KEY: &str = "PARQUET:field_id";
+
+fn field_id(field: &Field) -> Option<String> {
+    field.metadata().get(PARQUET_FIELD_ID_KEY).cloned()
+}
+
+/// Reconciliation key for a column: its Parquet field id when present (stable across renames),
+/// otherwise its name.
+#[derive(Hash, PartialEq, Eq, Clone)]
+enum ColKey {
+    Id(String),
+    Name(String),
+}
+
+fn col_key(field: &Field) -> ColKey {
+    match field_id(field) {
+        Some(id) => ColKey::Id(id),
+        None => ColKey::Name(field.name().clone()),
+    }
+}
+
 /// Reconcile a set of (possibly schema-evolved) Arrow schemas into a single target schema for
-/// schema-on-read by column name.
+/// schema-on-read.
 ///
-/// Fields are unioned in first-appearance order. A field's type is widened across the schemas it
-/// appears in (see [`widen_types`]). A field is nullable if it is absent from any input schema or
-/// marked nullable in any of them, so missing columns can be null-filled. When every input schema
-/// is identical the first schema is returned unchanged, keeping the common no-evolution path a
-/// no-op (preserving field order and nullability exactly).
+/// Columns are matched by Parquet field id when present (so a renamed column is tracked across
+/// schemas), otherwise by name, and unioned in first-appearance order. The target column name is
+/// taken from the last schema in which the column appears (newest-wins, so a rename resolves to
+/// the current name when schemas are supplied oldest-first). A field's type is widened across its
+/// occurrences (see [`widen_types`]); it is nullable if absent from any input schema or marked
+/// nullable in any of them. When every input schema is identical the first schema is returned
+/// unchanged, keeping the common no-evolution path a no-op.
 pub fn reconcile_schemas(schemas: &[SchemaRef]) -> SchemaRef {
     let Some(first) = schemas.first() else {
         return SchemaRef::from(Schema::empty());
@@ -183,29 +209,37 @@ pub fn reconcile_schemas(schemas: &[SchemaRef]) -> SchemaRef {
     }
 
     struct Acc {
+        name: String,
         data_type: DataType,
         present: usize,
         nullable: bool,
+        metadata: HashMap<String, String>,
     }
 
     let total = schemas.len();
-    let mut order: Vec<String> = Vec::new();
-    let mut acc: HashMap<String, Acc> = HashMap::new();
+    let mut order: Vec<ColKey> = Vec::new();
+    let mut acc: HashMap<ColKey, Acc> = HashMap::new();
     for schema in schemas {
         for field in schema.fields() {
-            let name = field.name();
-            if let Some(existing) = acc.get_mut(name) {
+            let key = col_key(field);
+            if let Some(existing) = acc.get_mut(&key) {
+                existing.name = field.name().clone(); // newest-wins (handles renames by id)
                 existing.data_type = widen_types(&existing.data_type, field.data_type());
                 existing.present += 1;
                 existing.nullable = existing.nullable || field.is_nullable();
+                for (k, v) in field.metadata() {
+                    existing.metadata.insert(k.clone(), v.clone());
+                }
             } else {
-                order.push(name.clone());
+                order.push(key.clone());
                 acc.insert(
-                    name.clone(),
+                    key,
                     Acc {
+                        name: field.name().clone(),
                         data_type: field.data_type().clone(),
                         present: 1,
                         nullable: field.is_nullable(),
+                        metadata: field.metadata().clone(),
                     },
                 );
             }
@@ -214,37 +248,56 @@ pub fn reconcile_schemas(schemas: &[SchemaRef]) -> SchemaRef {
 
     let fields: Vec<Field> = order
         .iter()
-        .filter_map(|name| {
-            acc.get(name).map(|a| {
+        .filter_map(|key| {
+            acc.get(key).map(|a| {
                 let nullable = a.nullable || a.present < total;
-                Field::new(name, a.data_type.clone(), nullable)
+                let field = Field::new(&a.name, a.data_type.clone(), nullable);
+                if a.metadata.is_empty() {
+                    field
+                } else {
+                    field.with_metadata(a.metadata.clone())
+                }
             })
         })
         .collect();
     SchemaRef::from(Schema::new(fields))
 }
 
-/// Adapt a [`RecordBatch`] to `target` for schema-on-read: select the target's columns by name
-/// (reordering as needed), cast columns whose type differs, and fill columns missing from the
-/// batch with nulls. Columns of `batch` absent from `target` are dropped. Returns the batch
-/// unchanged when its schema already matches `target`.
+/// Adapt a [`RecordBatch`] to `target` for schema-on-read: select the target's columns (matching
+/// by Parquet field id when present, else by name, so renamed columns still line up; reordering
+/// as needed), cast columns whose type differs, and fill columns missing from the batch with
+/// nulls. Columns of `batch` absent from `target` are dropped. Returns the batch unchanged when
+/// its schema already matches `target`.
 pub fn adapt_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
     if batch.schema().fields() == target.fields() {
         return Ok(batch.clone());
     }
     let num_rows = batch.num_rows();
+    let batch_schema = batch.schema();
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    for (i, field) in batch_schema.fields().iter().enumerate() {
+        if let Some(id) = field_id(field) {
+            by_id.insert(id, i);
+        }
+        by_name.insert(field.name().clone(), i);
+    }
+
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
     for field in target.fields() {
-        match batch.schema().index_of(field.name()) {
-            Ok(idx) => {
-                let col = batch.column(idx);
+        let idx = field_id(field)
+            .and_then(|id| by_id.get(&id).copied())
+            .or_else(|| by_name.get(field.name()).copied());
+        match idx {
+            Some(i) => {
+                let col = batch.column(i);
                 if col.data_type() == field.data_type() {
                     columns.push(col.clone());
                 } else {
                     columns.push(cast(col, field.data_type()).map_err(CoreError::ArrowError)?);
                 }
             }
-            Err(_) => columns.push(new_null_array(field.data_type(), num_rows)),
+            None => columns.push(new_null_array(field.data_type(), num_rows)),
         }
     }
     RecordBatch::try_new(target.clone(), columns).map_err(CoreError::ArrowError)
@@ -285,6 +338,49 @@ mod tests {
                 .map(|(n, t, nullable)| Field::new(*n, t.clone(), *nullable))
                 .collect::<Vec<_>>(),
         ))
+    }
+
+    fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> Field {
+        Field::new(name, dt, nullable).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    #[test]
+    fn test_reconcile_tracks_renamed_column_by_field_id() {
+        // Same field id (7), renamed `amount` -> `total_amount`, supplied oldest-first.
+        let old = SchemaRef::from(Schema::new(vec![
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("amount", DataType::Int64, false, 7),
+        ]));
+        let new = SchemaRef::from(Schema::new(vec![
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("total_amount", DataType::Int64, false, 7),
+        ]));
+
+        let target = reconcile_schemas(&[old.clone(), new]);
+        // Union keyed by id, newest name wins -> two columns, the renamed one current.
+        let names: Vec<&str> = target.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id", "total_amount"]);
+
+        // A batch written with the old name maps onto the new name by field id, not null-filled.
+        let old_batch = RecordBatch::try_new(
+            old,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100, 200])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let adapted = adapt_batch_to_schema(&old_batch, &target).unwrap();
+        let total = adapted
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total.values(), &[100, 200]);
+        assert_eq!(adapted.column(1).null_count(), 0);
     }
 
     #[test]
