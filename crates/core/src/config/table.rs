@@ -145,6 +145,17 @@ pub enum HudiTableConfig {
     /// When creating a metadata table instance, this value should be passed as the
     /// PartitionFields option.
     MetadataTablePartitions,
+
+    /// Whether Change Data Capture (CDC) is enabled for this table. When enabled, the
+    /// writer persists per-commit change data that a CDC query can read back.
+    CdcEnabled,
+
+    /// The CDC supplemental logging mode controlling how much change data is persisted.
+    ///
+    /// # See also
+    ///
+    /// - [`CdcSupplementalLoggingModeValue`] - Possible values for this configuration.
+    CdcSupplementalLoggingMode,
 }
 
 impl AsRef<str> for HudiTableConfig {
@@ -175,6 +186,8 @@ impl AsRef<str> for HudiTableConfig {
             Self::TimelineHistoryPath => "hoodie.timeline.history.path",
             Self::MetadataTableEnabled => "hoodie.metadata.enable",
             Self::MetadataTablePartitions => "hoodie.table.metadata.partitions",
+            Self::CdcEnabled => "hoodie.table.cdc.enabled",
+            Self::CdcSupplementalLoggingMode => "hoodie.table.cdc.supplemental.logging.mode",
         }
     }
 }
@@ -207,6 +220,12 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineHistoryPath => Some(HudiConfigValue::String("history".to_string())),
             Self::MetadataTableEnabled => Some(HudiConfigValue::Boolean(false)),
             Self::MetadataTablePartitions => Some(HudiConfigValue::List(vec![])),
+            Self::CdcEnabled => Some(HudiConfigValue::Boolean(false)),
+            Self::CdcSupplementalLoggingMode => Some(HudiConfigValue::String(
+                CdcSupplementalLoggingModeValue::DataBeforeAfter
+                    .as_ref()
+                    .to_string(),
+            )),
             _ => None,
         }
     }
@@ -306,6 +325,14 @@ impl ConfigParser for HudiTableConfig {
                 .map(HudiConfigValue::Boolean),
             Self::MetadataTablePartitions => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
+            Self::CdcEnabled => get_result
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::Boolean),
+            Self::CdcSupplementalLoggingMode => get_result
+                .and_then(CdcSupplementalLoggingModeValue::from_str)
+                .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
         }
     }
 
@@ -453,6 +480,37 @@ impl FromStr for BaseFileFormatValue {
             "hfile" => Ok(Self::HFile),
             "lance" => Ok(Self::Lance),
             "orc" => Err(UnsupportedValue(s.to_string())),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
+/// Config value for [HudiTableConfig::CdcSupplementalLoggingMode].
+///
+/// Controls how much change data the writer persists, which in turn determines what a CDC
+/// read can return directly versus what it must reconstruct from base/log files:
+/// - `cdc_op_key`: operation type and record key only.
+/// - `cdc_data_before`: also the before-image of each changed record.
+/// - `cdc_data_before_after`: also the after-image — fully self-contained change records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, AsRefStr, Default)]
+pub enum CdcSupplementalLoggingModeValue {
+    #[strum(serialize = "cdc_op_key")]
+    OpKeyOnly,
+    #[strum(serialize = "cdc_data_before")]
+    DataBefore,
+    #[strum(serialize = "cdc_data_before_after")]
+    #[default]
+    DataBeforeAfter,
+}
+
+impl FromStr for CdcSupplementalLoggingModeValue {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "cdc_op_key" | "op_key_only" | "op_key" => Ok(Self::OpKeyOnly),
+            "cdc_data_before" | "data_before" => Ok(Self::DataBefore),
+            "cdc_data_before_after" | "data_before_after" => Ok(Self::DataBeforeAfter),
             v => Err(InvalidValue(v.to_string())),
         }
     }

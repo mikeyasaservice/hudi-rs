@@ -98,7 +98,9 @@ pub use crate::config::read_options::{QueryType, ReadOptions};
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
-use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
+use crate::config::table::{
+    BaseFileFormatValue, CdcSupplementalLoggingModeValue, HudiTableConfig, TableTypeValue,
+};
 use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
@@ -790,6 +792,72 @@ impl Table {
                 .map(|f| fg_reader.read_file_slice(f, &fg_options)),
         )
         .await?;
+        Ok(batches)
+    }
+
+    /// Read Change Data Capture (CDC) change records for a commit range.
+    ///
+    /// Requires `hoodie.table.cdc.enabled=true`. Returns the persisted change records — each
+    /// carrying an `op` code (see [`crate::cdc::op`]) and before/after images — for the commits
+    /// in the `(start, end]` range resolved from `options` (defaulting to the full timeline).
+    ///
+    /// Currently supports the self-contained `cdc_data_before_after` supplemental logging mode
+    /// with Parquet CDC files. Other modes — which require reconstructing the before/after images
+    /// from base and log files — and log-based CDC files are not yet implemented and return an
+    /// [`CoreError::Unsupported`] error.
+    pub async fn read_cdc(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        use crate::error::CoreError;
+
+        if !crate::cdc::is_cdc_enabled(&self.hudi_configs) {
+            return Err(CoreError::Unsupported(
+                "CDC read requires hoodie.table.cdc.enabled=true".to_string(),
+            ));
+        }
+        let mode = crate::cdc::supplemental_logging_mode(&self.hudi_configs)?;
+        if mode != CdcSupplementalLoggingModeValue::DataBeforeAfter {
+            return Err(CoreError::Unsupported(format!(
+                "CDC supplemental logging mode '{}' is not yet supported; \
+                 only '{}' (self-contained change records) is",
+                mode.as_ref(),
+                CdcSupplementalLoggingModeValue::DataBeforeAfter.as_ref()
+            )));
+        }
+
+        let prepared = self.prepare_reader_options(options)?;
+        let Some((start, end)) = self.resolve_incremental_range(&prepared)? else {
+            return Ok(Vec::new());
+        };
+
+        // Completed commit / deltacommit / replacecommit instants in the (start, end] range.
+        let mut instants = self.timeline.get_completed_commits(false).await?;
+        instants.extend(self.timeline.get_completed_deltacommits(false).await?);
+        instants.extend(self.timeline.get_completed_replacecommits(false).await?);
+        instants.retain(|i| {
+            i.timestamp.as_str() > start.as_str() && i.timestamp.as_str() <= end.as_str()
+        });
+        instants.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        // Read CDC files with table-level options only (no incremental start/end), so the
+        // per-file read does not apply a commit-time mask to the already-scoped change records.
+        let fg_reader =
+            self.build_file_group_reader(HashMap::new(), std::iter::empty::<(&str, &str)>())?;
+        let read_options = ReadOptions::new();
+
+        let mut batches = Vec::new();
+        for instant in instants {
+            let metadata = self.timeline.get_instant_metadata(&instant).await?;
+            for rel_path in crate::cdc::cdc_file_paths_from_commit_metadata(&metadata) {
+                if !rel_path.to_ascii_lowercase().ends_with(".parquet") {
+                    return Err(CoreError::Unsupported(format!(
+                        "CDC file '{rel_path}' is not Parquet; log-based CDC files are not yet supported"
+                    )));
+                }
+                let batch = fg_reader
+                    .read_file_slice_from_paths(&rel_path, Vec::<&str>::new(), &read_options)
+                    .await?;
+                batches.push(batch);
+            }
+        }
         Ok(batches)
     }
 
@@ -1563,6 +1631,33 @@ mod tests {
 
         let mut snapshot_stream = hudi_table.read_stream(&ReadOptions::new()).await.unwrap();
         assert!(snapshot_stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_cdc_errors_when_cdc_disabled() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = Table::new(base_url.path()).await.unwrap();
+        let err = table.read_cdc(&ReadOptions::new()).await.unwrap_err();
+        assert!(matches!(err, CoreError::Unsupported(_)));
+        assert!(err.to_string().contains("hoodie.table.cdc.enabled"));
+    }
+
+    #[tokio::test]
+    async fn read_cdc_errors_for_unsupported_supplemental_mode() {
+        use crate::config::table::HudiTableConfig::{CdcEnabled, CdcSupplementalLoggingMode};
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = Table::new_with_options(
+            base_url.path(),
+            [
+                (CdcEnabled.as_ref(), "true"),
+                (CdcSupplementalLoggingMode.as_ref(), "cdc_op_key"),
+            ],
+        )
+        .await
+        .unwrap();
+        let err = table.read_cdc(&ReadOptions::new()).await.unwrap_err();
+        assert!(matches!(err, CoreError::Unsupported(_)));
+        assert!(err.to_string().contains("not yet supported"));
     }
 
     #[tokio::test]
